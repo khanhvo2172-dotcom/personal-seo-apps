@@ -1,0 +1,11 @@
+.env
+.env.*
+!.env.example
+token.json
+client_secret*.json
+.streamlit/secrets.toml
+*.ipynb
+__pycache__/
+*.pyc
+.venv/
+venv/

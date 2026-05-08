@@ -1,0 +1,10 @@
+streamlit>=1.28.0
+requests
+pandas
+python-dotenv
+Pillow
+google-api-python-client
+google-auth-httplib2
+google-auth-oauthlib
+gdown
+cloudinary
