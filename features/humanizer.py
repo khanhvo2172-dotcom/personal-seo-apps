@@ -1,6 +1,8 @@
 import re
+import os
 from dataclasses import dataclass
 
+import requests
 import streamlit as st
 
 
@@ -73,7 +75,7 @@ def render():
 
     col1, col2 = st.columns([1, 1])
     with col1:
-        mode = st.selectbox("Rewrite strength", ["Light cleanup", "Stronger cleanup"])
+        mode = st.selectbox("Rewrite mode", ["DeepSeek rewrite", "Light cleanup", "Stronger cleanup"])
     with col2:
         show_findings = st.checkbox("Show detected patterns", value=True)
 
@@ -85,7 +87,13 @@ def render():
         return
 
     findings = _find_patterns(text)
-    rewritten = _humanize(text, aggressive=mode == "Stronger cleanup")
+    if mode == "DeepSeek rewrite":
+        rewritten = _humanize_with_deepseek(text, findings)
+        if rewritten is None:
+            st.warning("DeepSeek is not configured or the API call failed. Showing rule-based cleanup instead.")
+            rewritten = _humanize(text, aggressive=True)
+    else:
+        rewritten = _humanize(text, aggressive=mode == "Stronger cleanup")
 
     st.subheader("Humanized text")
     st.text_area("Result", value=rewritten, height=300)
@@ -164,3 +172,63 @@ def _simplify_aggressive(text: str) -> str:
     out = re.sub(r"\b(in today'?s (?:fast-paced|ever-changing|digital) world),?\s*", "", out, flags=re.IGNORECASE)
     out = re.sub(r"\b(seamless, intuitive, and powerful|innovation, inspiration, and industry insights)\b", "", out, flags=re.IGNORECASE)
     return out
+
+
+def _private_value(key: str) -> str:
+    value = os.getenv(key, "").strip()
+    if value:
+        return value
+    try:
+        return str(st.secrets.get(key, "")).strip()
+    except Exception:
+        return ""
+
+
+def _humanize_with_deepseek(text: str, findings: list[dict[str, str | int]]) -> str | None:
+    api_key = _private_value("DEEPSEEK_API_KEY")
+    if not api_key:
+        st.error("Missing DEEPSEEK_API_KEY. Add it in Streamlit Cloud -> Settings -> Secrets.")
+        return None
+
+    pattern_summary = "\n".join(
+        f"- {row['Pattern']}: {row['Why it matters']}" for row in findings
+    ) or "- No specific patterns detected. Still improve naturalness and rhythm."
+
+    system_prompt = """You are a precise human writing editor.
+Rewrite the user's text so it sounds natural, specific, and human-written.
+Preserve the original meaning, facts, language, and intent.
+Remove AI-writing patterns: inflated significance, promotional language, vague attribution, superficial -ing phrases, AI vocabulary, negative parallelisms, rule-of-three padding, em dash overuse, generic conclusions, chatbot artifacts, and excessive hedging.
+Do not explain your process. Return only the rewritten text."""
+
+    user_prompt = f"""Detected patterns:
+{pattern_summary}
+
+Text to humanize:
+{text}"""
+
+    try:
+        response = requests.post(
+            "https://api.deepseek.com/chat/completions",
+            headers={
+                "Authorization": f"Bearer {api_key}",
+                "Content-Type": "application/json",
+            },
+            json={
+                "model": "deepseek-v4-flash",
+                "messages": [
+                    {"role": "system", "content": system_prompt},
+                    {"role": "user", "content": user_prompt},
+                ],
+                "thinking": {"type": "disabled"},
+                "temperature": 0.4,
+                "max_tokens": 2500,
+                "stream": False,
+            },
+            timeout=60,
+        )
+        response.raise_for_status()
+        data = response.json()
+        return data["choices"][0]["message"]["content"].strip()
+    except Exception as exc:
+        st.error(f"DeepSeek request failed: {exc}")
+        return None

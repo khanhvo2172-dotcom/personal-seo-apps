@@ -54,6 +54,7 @@ CLOUDINARY_CLOUD_NAME = "your_cloudinary_cloud_name"
 CLOUDINARY_API_KEY = "your_cloudinary_api_key"
 CLOUDINARY_API_SECRET = "your_cloudinary_api_secret"
 GOOGLE_TOKEN_JSON = '''paste_the_full_token_json_here'''
+DEEPSEEK_API_KEY = "your_deepseek_key"
 ```
 
 Do not paste your Windows path (`C:\...`) into the deployed app. Streamlit Cloud runs on a remote Linux server and cannot read files from your computer.
