@@ -5,27 +5,38 @@ load_dotenv()
 
 st.set_page_config(
     page_title="Personal Tools",
-    page_icon="🛠️",
+    page_icon="tools",
     layout="wide",
 )
 
 if "google_creds" not in st.session_state:
     st.session_state.google_creds = None
 
-from features import settings, keyword_grouping, download_gdrive_images, check_links, extract_optimize_images
+from features import (
+    check_links,
+    download_gdrive_images,
+    extract_optimize_images,
+    humanizer,
+    keyword_grouping,
+    settings,
+)
 
-st.title("🛠️ Personal Tools")
+st.title("Personal Tools")
 
-tab_settings, tab_kw, tab_gdrive, tab_links, tab_extract = st.tabs([
-    "⚙️ Settings",
-    "🔑 Keyword Grouping",
-    "📥 Download GDrive Images",
-    "🔗 Check Links in GDocs",
-    "🖼️ Extract & Optimize Images",
+tab_settings, tab_humanizer, tab_kw, tab_gdrive, tab_links, tab_extract = st.tabs([
+    "Settings",
+    "Humanizer",
+    "Keyword Grouping",
+    "Download GDrive Images",
+    "Check Links in GDocs",
+    "Extract & Optimize Images",
 ])
 
 with tab_settings:
     settings.render()
+
+with tab_humanizer:
+    humanizer.render()
 
 with tab_kw:
     keyword_grouping.render()
