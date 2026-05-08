@@ -38,6 +38,10 @@ def render():
         )
         if secret_path != os.getenv("GOOGLE_CLIENT_SECRET_PATH", ""):
             _save("GOOGLE_CLIENT_SECRET_PATH", secret_path)
+        st.caption(
+            "On Streamlit Cloud, do not use a Windows file path here. "
+            "Add GOOGLE_TOKEN_JSON in App settings -> Secrets instead."
+        )
 
     with col_status:
         st.write("")
@@ -110,6 +114,12 @@ def _auto_load_token():
 
 
 def _run_oauth(secret_path: str):
+    if os.getenv("STREAMLIT_RUNTIME_ENV") or os.getenv("HOSTNAME"):
+        st.error(
+            "This button only works on your local computer. "
+            "For Streamlit Cloud, add GOOGLE_TOKEN_JSON in App settings -> Secrets."
+        )
+        return
     if not secret_path or not Path(secret_path).exists():
         st.error("Please provide a valid path to your OAuth Client Secret JSON file first.")
         return

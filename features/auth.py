@@ -14,10 +14,20 @@ SCOPES = [
 TOKEN_PATH = Path("token.json")
 
 
+def _get_private_value(key: str) -> str:
+    value = os.getenv(key, "").strip()
+    if value:
+        return value
+    try:
+        return str(st.secrets.get(key, "")).strip()
+    except Exception:
+        return ""
+
+
 def _load_token_info_from_env() -> dict | None:
     """Load Google OAuth token JSON from private hosting environment variables."""
-    token_json = os.getenv("GOOGLE_TOKEN_JSON", "").strip()
-    token_b64 = os.getenv("GOOGLE_TOKEN_JSON_B64", "").strip()
+    token_json = _get_private_value("GOOGLE_TOKEN_JSON")
+    token_b64 = _get_private_value("GOOGLE_TOKEN_JSON_B64")
 
     if token_b64:
         try:

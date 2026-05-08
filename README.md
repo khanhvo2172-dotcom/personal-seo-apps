@@ -46,6 +46,18 @@ GOOGLE_TOKEN_JSON
 
 `GOOGLE_TOKEN_JSON` should be the full contents of your local `token.json`.
 
+For Streamlit Community Cloud, open your app dashboard, go to **Settings -> Secrets**, and add:
+
+```toml
+SERP_API_KEY = "your_serper_key"
+CLOUDINARY_CLOUD_NAME = "your_cloudinary_cloud_name"
+CLOUDINARY_API_KEY = "your_cloudinary_api_key"
+CLOUDINARY_API_SECRET = "your_cloudinary_api_secret"
+GOOGLE_TOKEN_JSON = '''paste_the_full_token_json_here'''
+```
+
+Do not paste your Windows path (`C:\...`) into the deployed app. Streamlit Cloud runs on a remote Linux server and cannot read files from your computer.
+
 ## Deploy
 
 This is a Streamlit app, so the recommended first deployment is Railway. The included `Procfile` starts the app with:
