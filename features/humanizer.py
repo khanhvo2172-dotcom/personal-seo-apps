@@ -5,6 +5,7 @@ from dataclasses import dataclass
 
 import requests
 import streamlit as st
+import streamlit.components.v1 as components
 import pandas as pd
 
 
@@ -109,6 +110,50 @@ def render():
             "Suggestions": st.column_config.TextColumn(width="large"),
             "Issue": st.column_config.TextColumn(width="medium"),
         },
+    )
+
+    _copy_button(results)
+
+
+def _copy_button(results: list[dict]) -> None:
+    suggestions_json = json.dumps("\n\n".join(r["suggestion"] for r in results))
+    components.html(
+        f"""
+        <button id="copy-btn" onclick="copyText()" style="
+            background:#FF4B4B;color:white;border:none;
+            padding:8px 18px;border-radius:6px;cursor:pointer;
+            font-size:14px;font-family:sans-serif;margin-top:4px;">
+            Copy suggestions
+        </button>
+        <span id="copy-msg" style="
+            margin-left:10px;color:green;font-family:sans-serif;
+            font-size:14px;display:none;">
+            Copied!
+        </span>
+        <script>
+        function copyText() {{
+            var text = {suggestions_json};
+            if (navigator.clipboard && window.isSecureContext) {{
+                navigator.clipboard.writeText(text).then(showMsg);
+            }} else {{
+                var ta = document.createElement('textarea');
+                ta.value = text;
+                ta.style.cssText = 'position:fixed;opacity:0';
+                document.body.appendChild(ta);
+                ta.select();
+                document.execCommand('copy');
+                document.body.removeChild(ta);
+                showMsg();
+            }}
+        }}
+        function showMsg() {{
+            var msg = document.getElementById('copy-msg');
+            msg.style.display = 'inline';
+            setTimeout(function() {{ msg.style.display = 'none'; }}, 2000);
+        }}
+        </script>
+        """,
+        height=50,
     )
 
 
