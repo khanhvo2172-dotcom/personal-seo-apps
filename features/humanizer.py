@@ -1,9 +1,11 @@
 import re
 import os
+import json
 from dataclasses import dataclass
 
 import requests
 import streamlit as st
+import pandas as pd
 
 
 @dataclass(frozen=True)
@@ -22,10 +24,9 @@ RULES = [
     PatternRule("Negative parallelism", r"\b(not only\b.*?\bbut also\b|not just\b.*?\bit'?s\b|not merely\b.*?\bit'?s\b)", "Formulaic contrast structure."),
     PatternRule("Filler", r"\b(in order to|due to the fact that|at this point in time|in the event that|has the ability to|it is important to note that)\b", "Unneeded filler."),
     PatternRule("Hedging", r"\b(could potentially|possibly be argued|might perhaps|it appears that|it seems that)\b", "Over-qualifies the point."),
-    PatternRule("Chatbot artifacts", r"\b(i hope this helps|of course|certainly|great question|you'?re absolutely right|let me know if|here is an overview)\b", "Looks pasted from a chatbot response."),
+    PatternRule("Chatbot artifacts", r"\b(i hope this help|of course|certainly|great question|you're absolutely right|let me know if|here is an overview)\b", "Looks pasted from a chatbot response."),
     PatternRule("Knowledge disclaimer", r"\b(as of my last|up to my last|training update|based on available information|specific details are limited)\b", "AI-style knowledge disclaimer."),
 ]
-
 
 REPLACEMENTS = [
     (r"\bAdditionally,\s*", "Also, "),
@@ -57,154 +58,115 @@ REPLACEMENTS = [
     (r"\bCertainly!?\s*", ""),
     (r"\bGreat question!?\s*", ""),
     (r"\*\*([^*]+)\*\*", r"\1"),
-    (r"[–—]", ", "),
-    (r"[“”]", '"'),
-    (r"[‘’]", "'"),
+    (r"[--]", ", "),
+    (r'["]', '"'),
+    (r"[']", "'"),
 ]
 
 
 def render():
     st.header("Humanizer")
-    st.caption("Detects common AI-writing patterns and rewrites text into a cleaner, more natural draft.")
+    st.caption("Detects AI-writing patterns sentence by sentence and suggests cleaner rewrites.")
 
     text = st.text_area(
-        "Paste text to humanize",
+        "Paste text to analyze",
         height=280,
         placeholder="Paste AI-sounding text here...",
     )
 
-    col1, col2 = st.columns([1, 1])
-    with col1:
-        mode = st.selectbox("Rewrite mode", ["DeepSeek rewrite", "Light cleanup", "Stronger cleanup"])
-    with col2:
-        show_findings = st.checkbox("Show detected patterns", value=True)
-
-    if not st.button("Humanize", type="primary"):
+    if not st.button("Analyze", type="primary"):
         return
 
     if not text.strip():
         st.error("Please paste text first.")
         return
 
-    findings = _find_patterns(text)
-    if mode == "DeepSeek rewrite":
-        rewritten = _humanize_with_deepseek(text, findings)
-        if rewritten is None:
-            st.warning("DeepSeek is not configured or the API call failed. Showing rule-based cleanup instead.")
-            rewritten = _humanize(text, aggressive=True)
-    else:
-        rewritten = _humanize(text, aggressive=mode == "Stronger cleanup")
+    sentences = _split_sentences(text)
+    flagged = _flag_sentences(sentences)
 
-    st.subheader("Humanized text")
-    st.text_area("Result", value=rewritten, height=300)
-    st.download_button(
-        "Download .txt",
-        data=rewritten.encode("utf-8"),
-        file_name="humanized_text.txt",
-        mime="text/plain",
+    if not flagged:
+        st.success("No obvious AI-writing patterns found.")
+        return
+
+    with st.spinner("Generating suggestions..."):
+        results = _get_suggestions(flagged)
+
+    st.subheader("Analysis Results")
+    df = pd.DataFrame([
+        {
+            "Current Sentence": r["sentence"],
+            "Suggestions": r["suggestion"],
+            "Issue": r["issue"],
+        }
+        for r in results
+    ])
+    st.dataframe(
+        df,
+        use_container_width=True,
+        hide_index=True,
+        column_config={
+            "Current Sentence": st.column_config.TextColumn(width="large"),
+            "Suggestions": st.column_config.TextColumn(width="large"),
+            "Issue": st.column_config.TextColumn(width="medium"),
+        },
     )
 
-    if show_findings:
-        st.subheader("Detected patterns")
-        if not findings:
-            st.success("No obvious AI-writing patterns found.")
-        else:
-            st.dataframe(findings, use_container_width=True)
+
+def _split_sentences(text: str) -> list[str]:
+    return [s.strip() for s in re.split(r"(?<=[.!?])\s+", text) if s.strip()]
 
 
-def _find_patterns(text: str) -> list[dict[str, str | int]]:
-    rows = []
-    for rule in RULES:
-        matches = re.findall(rule.pattern, text, flags=re.IGNORECASE | re.DOTALL)
-        if matches:
-            rows.append({
-                "Pattern": rule.name,
-                "Count": len(matches),
-                "Why it matters": rule.issue,
-            })
-    em_dash_count = text.count("—") + text.count("–")
-    if em_dash_count:
-        rows.append({
-            "Pattern": "Dash overuse",
-            "Count": em_dash_count,
-            "Why it matters": "Frequent long dashes can make text feel AI-written.",
-        })
-    return rows
+def _flag_sentences(sentences: list[str]) -> list[dict]:
+    flagged = []
+    seen: set[str] = set()
+    for sentence in sentences:
+        matched_issue = None
+        for rule in RULES:
+            if re.search(rule.pattern, sentence, flags=re.IGNORECASE | re.DOTALL):
+                matched_issue = rule.issue
+                break
+        if matched_issue is None:
+            em_dashes = sentence.count("—") + sentence.count("–")
+            if em_dashes:
+                matched_issue = "Frequent long dashes can make text feel AI-written."
+        if matched_issue and sentence not in seen:
+            seen.add(sentence)
+            flagged.append({"sentence": sentence, "issue": matched_issue, "suggestion": ""})
+    return flagged
 
 
-def _humanize(text: str, aggressive: bool) -> str:
-    out = text.strip()
+def _get_suggestions(flagged: list[dict]) -> list[dict]:
+    api_key = _private_value("DEEPSEEK_API_KEY")
+    if api_key:
+        result = _suggest_with_deepseek(flagged, api_key)
+        if result:
+            return result
+    for item in flagged:
+        item["suggestion"] = _apply_replacements(item["sentence"])
+    return flagged
+
+
+def _apply_replacements(sentence: str) -> str:
+    out = sentence
     for pattern, replacement in REPLACEMENTS:
         out = re.sub(pattern, replacement, out, flags=re.IGNORECASE)
-
-    out = _remove_formulaic_sentences(out)
-    if aggressive:
-        out = _simplify_aggressive(out)
-
     out = re.sub(r"[ \t]+", " ", out)
-    out = re.sub(r"\s+\n", "\n", out)
-    out = re.sub(r"\n{3,}", "\n\n", out)
     out = re.sub(r"\s+([,.!?;:])", r"\1", out)
     return out.strip()
 
 
-def _remove_formulaic_sentences(text: str) -> str:
-    sentences = re.split(r"(?<=[.!?])\s+", text)
-    blocked = [
-        r"^This (?:serves|stands) as",
-        r"^The future looks bright",
-        r"^Exciting times lie ahead",
-        r"^This represents a major step",
-        r"^In conclusion,",
-    ]
-    kept = []
-    for sentence in sentences:
-        if any(re.search(p, sentence, flags=re.IGNORECASE) for p in blocked):
-            continue
-        kept.append(sentence)
-    return " ".join(kept)
-
-
-def _simplify_aggressive(text: str) -> str:
-    out = re.sub(r"\bnot only ([^.;]+?) but also ([^.;]+)", r"\1 and \2", text, flags=re.IGNORECASE)
-    out = re.sub(r"\bIt's not just about ([^.;]+?);?\s*it's about ([^.;]+)", r"It is about \1 and \2", out, flags=re.IGNORECASE)
-    out = re.sub(r"\b(could potentially|might possibly|may potentially)\b", "may", out, flags=re.IGNORECASE)
-    out = re.sub(r"\b(in today'?s (?:fast-paced|ever-changing|digital) world),?\s*", "", out, flags=re.IGNORECASE)
-    out = re.sub(r"\b(seamless, intuitive, and powerful|innovation, inspiration, and industry insights)\b", "", out, flags=re.IGNORECASE)
-    return out
-
-
-def _private_value(key: str) -> str:
-    value = os.getenv(key, "").strip()
-    if value:
-        return value
-    try:
-        return str(st.secrets.get(key, "")).strip()
-    except Exception:
-        return ""
-
-
-def _humanize_with_deepseek(text: str, findings: list[dict[str, str | int]]) -> str | None:
-    api_key = _private_value("DEEPSEEK_API_KEY")
-    if not api_key:
-        st.error("Missing DEEPSEEK_API_KEY. Add it in Streamlit Cloud -> Settings -> Secrets.")
-        return None
-
-    pattern_summary = "\n".join(
-        f"- {row['Pattern']}: {row['Why it matters']}" for row in findings
-    ) or "- No specific patterns detected. Still improve naturalness and rhythm."
-
+def _suggest_with_deepseek(flagged: list[dict], api_key: str) -> list[dict] | None:
+    sentences_block = "\n".join(
+        f"{i + 1}. {item['sentence']}" for i, item in enumerate(flagged)
+    )
     system_prompt = """You are a precise human writing editor.
-Rewrite the user's text so it sounds natural, specific, and human-written.
+For each numbered sentence, rewrite it to sound natural, specific, and human-written.
+Remove AI-writing patterns: inflated significance, promotional language, vague attribution, AI vocabulary, filler, hedging, chatbot artifacts.
 Preserve the original meaning, facts, language, and intent.
-Remove AI-writing patterns: inflated significance, promotional language, vague attribution, superficial -ing phrases, AI vocabulary, negative parallelisms, rule-of-three padding, em dash overuse, generic conclusions, chatbot artifacts, and excessive hedging.
-Do not explain your process. Return only the rewritten text."""
+Return ONLY a JSON array. Each element: {"index": <1-based int>, "suggestion": "<rewritten sentence>"}.
+Do not explain. Return valid JSON only."""
 
-    user_prompt = f"""Detected patterns:
-{pattern_summary}
-
-Text to humanize:
-{text}"""
+    user_prompt = f"Rewrite these sentences:\n{sentences_block}"
 
     try:
         response = requests.post(
@@ -228,7 +190,24 @@ Text to humanize:
         )
         response.raise_for_status()
         data = response.json()
-        return data["choices"][0]["message"]["content"].strip()
+        raw = data["choices"][0]["message"]["content"].strip()
+        raw = re.sub(r"^```(?:json)?\s*", "", raw)
+        raw = re.sub(r"\s*```$", "", raw)
+        parsed = json.loads(raw)
+        for i, item in enumerate(flagged):
+            match = next((x for x in parsed if x.get("index") == i + 1), None)
+            item["suggestion"] = match["suggestion"] if match else _apply_replacements(item["sentence"])
+        return flagged
     except Exception as exc:
-        st.error(f"DeepSeek request failed: {exc}")
+        st.warning(f"DeepSeek request failed: {exc}. Falling back to rule-based suggestions.")
         return None
+
+
+def _private_value(key: str) -> str:
+    value = os.getenv(key, "").strip()
+    if value:
+        return value
+    try:
+        return str(st.secrets.get(key, "")).strip()
+    except Exception:
+        return ""
