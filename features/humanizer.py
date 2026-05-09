@@ -116,14 +116,17 @@ def render():
 
 
 def _copy_button(results: list[dict]) -> None:
-    suggestions_json = json.dumps("\n\n".join(r["suggestion"] for r in results))
+    rows = ["\t".join(["Current Sentence", "Suggestions", "Issue"])]
+    for r in results:
+        rows.append("\t".join([r["sentence"], r["suggestion"], r["issue"]]))
+    table_json = json.dumps("\n".join(rows))
     components.html(
         f"""
         <button id="copy-btn" onclick="copyText()" style="
             background:#FF4B4B;color:white;border:none;
             padding:8px 18px;border-radius:6px;cursor:pointer;
             font-size:14px;font-family:sans-serif;margin-top:4px;">
-            Copy suggestions
+            Copy table
         </button>
         <span id="copy-msg" style="
             margin-left:10px;color:green;font-family:sans-serif;
@@ -132,7 +135,7 @@ def _copy_button(results: list[dict]) -> None:
         </span>
         <script>
         function copyText() {{
-            var text = {suggestions_json};
+            var text = {table_json};
             if (navigator.clipboard && window.isSecureContext) {{
                 navigator.clipboard.writeText(text).then(showMsg);
             }} else {{
