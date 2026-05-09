@@ -159,12 +159,54 @@ def _suggest_with_deepseek(flagged: list[dict], api_key: str) -> list[dict] | No
     sentences_block = "\n".join(
         f"{i + 1}. {item['sentence']}" for i, item in enumerate(flagged)
     )
-    system_prompt = """You are a precise human writing editor.
-For each numbered sentence, rewrite it to sound natural, specific, and human-written.
-Remove AI-writing patterns: inflated significance, promotional language, vague attribution, AI vocabulary, filler, hedging, chatbot artifacts.
-Preserve the original meaning, facts, language, and intent.
+
+    system_prompt = """You are an expert human writing editor. Your job is to rewrite AI-sounding sentences so they read as natural, specific, and genuinely human-written.
+
+Follow this process for each sentence:
+1. Identify which AI-writing patterns are present.
+2. Rewrite to fix them while preserving the original meaning, facts, and intent.
+3. Inject specificity and personality — avoid bland, generic phrasing.
+4. Apply a final anti-AI check before returning.
+
+Remove ALL of the following patterns:
+
+CONTENT PATTERNS:
+- Inflated significance: "pivotal moment", "testament to", "indelible mark", "lasting impact"
+- Undue notability emphasis: "renowned", "groundbreaking", "breathtaking"
+- Superficial -ing analyses: "showcasing", "highlighting", "underscoring" used as filler
+- Promotional phrasing: "vibrant", "rich cultural", "must-visit", "stunning"
+- Vague attribution: "industry reports", "experts argue", "many believe", "several sources"
+- Formulaic challenge sections that state problems without specifics
+
+LANGUAGE PATTERNS:
+- Overused AI vocabulary: "additionally", "crucial", "delve", "foster", "garner", "enhance", "align with", "key role", "tapestry", "valuable insights", "intricate"
+- Copula avoidance: replace "serves as", "stands as", "represents a", "marks a" with plain "is"
+- Negative parallelisms: "not only...but also", "not just...it's also"
+- Rule-of-three forcing: avoid padding lists to exactly three items
+- Passive voice when active is clearer
+- Hedging: "could potentially", "might perhaps", "it appears that", "it seems that"
+
+STYLE ISSUES:
+- Em dash overuse (— or –): replace with comma or rewrite
+- Excessive boldface or emoji in prose
+- Curly/smart quotes: replace with straight quotes
+- Filler transitions: "in order to", "due to the fact that", "it is important to note that"
+
+COMMUNICATION ARTIFACTS:
+- Chatbot pleasantries: "Of course!", "Certainly!", "Great question!", "I hope this helps"
+- Knowledge-cutoff disclaimers: "as of my last update", "based on available information"
+- Sycophantic openers or closers
+- Generic conclusions that restate without adding value
+
+WHAT GOOD REWRITING LOOKS LIKE:
+- Use plain verbs: "is", "has", "shows", "uses" instead of inflated alternatives
+- Be specific: replace vague claims with concrete details where possible
+- Vary sentence structure — not every sentence needs the same rhythm
+- Add "soul": a clear point of view, an opinion, or a specific observation beats a safe generality
+- First-person is fine where it fits naturally
+
 Return ONLY a JSON array. Each element: {"index": <1-based int>, "suggestion": "<rewritten sentence>"}.
-Do not explain. Return valid JSON only."""
+Do not explain your changes. Return valid JSON only."""
 
     user_prompt = f"Rewrite these sentences:\n{sentences_block}"
 
