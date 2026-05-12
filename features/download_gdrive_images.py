@@ -2,8 +2,10 @@ import io
 import re
 import zipfile
 import tempfile
+import requests
 import streamlit as st
 from pathlib import Path
+from urllib.parse import unquote
 
 
 def render():
@@ -38,6 +40,7 @@ def _extract_file_id(url: str) -> str | None:
     url = url.strip()
     patterns = [
         r"/file/d/([a-zA-Z0-9_-]{20,})",
+        r"/folders/([a-zA-Z0-9_-]{20,})",
         r"[?&]id=([a-zA-Z0-9_-]{20,})",
         r"/d/([a-zA-Z0-9_-]{20,})",
     ]
@@ -48,12 +51,177 @@ def _extract_file_id(url: str) -> str | None:
     return None
 
 
-def _run_download(links: list[str], zip_name: str):
+def _safe_filename(name: str) -> str:
+    name = Path(name).name.strip().strip('"')
+    name = re.sub(r'[<>:"/\\|?*\x00-\x1f]+', "_", name)
+    return name or "google_drive_file"
+
+
+def _filename_from_content_disposition(header: str) -> str | None:
+    if not header:
+        return None
+
+    m = re.search(r"filename\*=UTF-8''([^;]+)", header, flags=re.I)
+    if m:
+        return _safe_filename(unquote(m.group(1)))
+
+    m = re.search(r'filename="?([^";]+)"?', header, flags=re.I)
+    if m:
+        return _safe_filename(m.group(1))
+
+    return None
+
+
+def _extension_from_content_type(content_type: str) -> str:
+    content_type = content_type.split(";", 1)[0].strip().lower()
+    return {
+        "image/jpeg": ".jpg",
+        "image/png": ".png",
+        "image/gif": ".gif",
+        "image/webp": ".webp",
+        "image/svg+xml": ".svg",
+        "image/bmp": ".bmp",
+        "image/tiff": ".tif",
+    }.get(content_type, "")
+
+
+def _is_download_response(resp: requests.Response) -> bool:
+    content_type = resp.headers.get("content-type", "").lower()
+    content_disposition = resp.headers.get("content-disposition", "").lower()
+    return (
+        resp.ok
+        and "text/html" not in content_type
+        and (
+            "attachment" in content_disposition
+            or content_type.startswith("image/")
+            or content_type == "application/octet-stream"
+        )
+    )
+
+
+def _confirm_url_from_html(html: str) -> str | None:
+    patterns = [
+        r'href="(/uc\?[^"]*confirm=[^"]*)"',
+        r'href="(https://drive\.google\.com/uc\?[^"]*confirm=[^"]*)"',
+        r'action="(https://drive\.google\.com/uc\?[^"]*)"',
+    ]
+    for pattern in patterns:
+        m = re.search(pattern, html)
+        if m:
+            url = m.group(1).replace("&amp;", "&")
+            if url.startswith("/"):
+                return f"https://drive.google.com{url}"
+            return url
+    return None
+
+
+def _write_response(resp: requests.Response, output_dir: str, file_id: str) -> str:
+    filename = _filename_from_content_disposition(resp.headers.get("content-disposition", ""))
+    if not filename:
+        ext = _extension_from_content_type(resp.headers.get("content-type", ""))
+        filename = f"{file_id}{ext}"
+
+    out_path = Path(output_dir) / _safe_filename(filename)
+    counter = 2
+    while out_path.exists():
+        out_path = Path(output_dir) / f"{out_path.stem}_{counter}{out_path.suffix}"
+        counter += 1
+
+    with out_path.open("wb") as f:
+        for chunk in resp.iter_content(chunk_size=1024 * 1024):
+            if chunk:
+                f.write(chunk)
+
+    if out_path.stat().st_size == 0:
+        out_path.unlink(missing_ok=True)
+        raise RuntimeError("Google Drive returned an empty file.")
+
+    return str(out_path)
+
+
+def _download_public_file(file_id: str, output_dir: str) -> str:
+    session = requests.Session()
+    base_url = "https://drive.google.com/uc"
+    params = {"export": "download", "id": file_id}
+
+    resp = session.get(base_url, params=params, stream=True, timeout=90)
+    if _is_download_response(resp):
+        return _write_response(resp, output_dir, file_id)
+
+    confirm_token = next(
+        (value for key, value in session.cookies.items() if key.startswith("download_warning")),
+        None,
+    )
+    if confirm_token:
+        resp = session.get(
+            base_url,
+            params={**params, "confirm": confirm_token},
+            stream=True,
+            timeout=90,
+        )
+        if _is_download_response(resp):
+            return _write_response(resp, output_dir, file_id)
+
+    html = resp.text if "text/html" in resp.headers.get("content-type", "").lower() else ""
+    confirm_url = _confirm_url_from_html(html)
+    if confirm_url:
+        resp = session.get(confirm_url, stream=True, timeout=90)
+        if _is_download_response(resp):
+            return _write_response(resp, output_dir, file_id)
+
+    if "quota" in html.lower() or "too many users" in html.lower():
+        raise RuntimeError("Google Drive download quota was exceeded for this file.")
+    if "access denied" in html.lower() or "permission" in html.lower():
+        raise RuntimeError("Google Drive denied access to this file.")
+    if "folder" in html.lower():
+        raise RuntimeError("This looks like a folder link. Please paste direct file links.")
+
+    status = f"HTTP {resp.status_code}" if resp.status_code else "unknown response"
+    raise RuntimeError(f"Google Drive did not return a downloadable file ({status}).")
+
+
+def _download_with_drive_api(file_id: str, output_dir: str) -> str | None:
     try:
-        import gdown
-    except ImportError:
-        st.error("gdown is not installed. Run: `pip install gdown`")
-        return
+        from features.auth import get_credentials
+        from googleapiclient.discovery import build
+        from googleapiclient.http import MediaIoBaseDownload
+    except Exception:
+        return None
+
+    creds = get_credentials()
+    if not creds:
+        return None
+
+    service = build("drive", "v3", credentials=creds)
+    meta = service.files().get(fileId=file_id, fields="name,mimeType").execute()
+    request = service.files().get_media(fileId=file_id)
+    buf = io.BytesIO()
+    downloader = MediaIoBaseDownload(buf, request)
+
+    done = False
+    while not done:
+        _, done = downloader.next_chunk()
+
+    filename = _safe_filename(meta.get("name") or file_id)
+    if "." not in filename:
+        filename += _extension_from_content_type(meta.get("mimeType", ""))
+
+    out_path = Path(output_dir) / filename
+    out_path.write_bytes(buf.getvalue())
+    return str(out_path)
+
+
+def _download_gdrive_file(file_id: str, output_dir: str) -> str:
+    try:
+        return _download_public_file(file_id, output_dir)
+    except Exception as public_error:
+        api_path = _download_with_drive_api(file_id, output_dir)
+        if api_path:
+            return api_path
+        raise public_error
+
+
+def _run_download(links: list[str], zip_name: str):
 
     log_area = st.empty()
     logs: list[str] = []
@@ -69,17 +237,11 @@ def _run_download(links: list[str], zip_name: str):
                 log_area.code("\n".join(logs))
                 continue
 
-            gdrive_url = f"https://drive.google.com/uc?id={file_id}"
             logs.append(f"[{i}/{len(links)}] ⬇️  Downloading file ID: {file_id}")
             log_area.code("\n".join(logs))
 
             try:
-                out_path = gdown.download(
-                    gdrive_url,
-                    output=tmp_dir + "/",
-                    quiet=True,
-                    fuzzy=True,
-                )
+                out_path = _download_gdrive_file(file_id, tmp_dir)
                 if out_path and Path(out_path).exists():
                     downloaded_paths.append(out_path)
                     logs.append(f"[{i}/{len(links)}] ✅  Saved → {Path(out_path).name}")
