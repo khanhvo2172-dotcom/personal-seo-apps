@@ -1,12 +1,12 @@
 import re
 import os
 import json
+import html
 from dataclasses import dataclass
 
 import requests
 import streamlit as st
 import streamlit.components.v1 as components
-import pandas as pd
 
 
 @dataclass(frozen=True)
@@ -93,33 +93,51 @@ def render():
         results = _get_suggestions(flagged)
 
     st.subheader("Analysis Results")
-    df = pd.DataFrame([
-        {
-            "Current Sentence": r["sentence"],
-            "Suggestions": r["suggestion"],
-            "Issue": r["issue"],
-        }
-        for r in results
-    ])
-    st.dataframe(
-        df,
-        use_container_width=True,
-        hide_index=True,
-        column_config={
-            "Current Sentence": st.column_config.TextColumn(width="large"),
-            "Suggestions": st.column_config.TextColumn(width="large"),
-            "Issue": st.column_config.TextColumn(width="medium"),
-        },
-    )
-
+    _render_results_table(results)
     _copy_button(results)
 
 
+def _render_results_table(results: list[dict]) -> None:
+    st.markdown(
+        f"""
+        <style>
+            .humanizer-results {{
+                width: 100%;
+                border-collapse: collapse;
+                table-layout: fixed;
+                font-size: 0.92rem;
+            }}
+            .humanizer-results th,
+            .humanizer-results td {{
+                border: 1px solid rgba(49, 51, 63, 0.18);
+                padding: 0.65rem 0.75rem;
+                text-align: left;
+                vertical-align: top;
+                white-space: pre-wrap;
+                overflow-wrap: anywhere;
+                word-break: break-word;
+            }}
+            .humanizer-results th {{
+                background: rgba(49, 51, 63, 0.06);
+                font-weight: 600;
+            }}
+            .humanizer-results col:nth-child(1),
+            .humanizer-results col:nth-child(2) {{
+                width: 40%;
+            }}
+            .humanizer-results col:nth-child(3) {{
+                width: 20%;
+            }}
+        </style>
+        {_results_table_html(results, include_styles=False)}
+        """,
+        unsafe_allow_html=True,
+    )
+
+
 def _copy_button(results: list[dict]) -> None:
-    rows = ["\t".join(["Current Sentence", "Suggestions", "Issue"])]
-    for r in results:
-        rows.append("\t".join([r["sentence"], r["suggestion"], r["issue"]]))
-    table_json = json.dumps("\n".join(rows))
+    plain_json = json.dumps(_results_table_tsv(results))
+    html_json = json.dumps(_results_table_html(results, include_styles=True))
     components.html(
         f"""
         <button id="copy-btn" onclick="copyText()" style="
@@ -135,19 +153,47 @@ def _copy_button(results: list[dict]) -> None:
         </span>
         <script>
         function copyText() {{
-            var text = {table_json};
-            if (navigator.clipboard && window.isSecureContext) {{
-                navigator.clipboard.writeText(text).then(showMsg);
+            var plainText = {plain_json};
+            var htmlText = {html_json};
+            if (navigator.clipboard && window.ClipboardItem) {{
+                var item = new ClipboardItem({{
+                    'text/html': new Blob([htmlText], {{ type: 'text/html' }}),
+                    'text/plain': new Blob([plainText], {{ type: 'text/plain' }})
+                }});
+                navigator.clipboard.write([item]).then(showMsg).catch(function() {{
+                    copyFallback(htmlText, plainText);
+                }});
             }} else {{
+                copyFallback(htmlText, plainText);
+            }}
+        }}
+        function copyFallback(htmlText, plainText) {{
+            var container = document.createElement('div');
+            container.contentEditable = true;
+            container.style.cssText = 'position:fixed;left:-9999px;top:0';
+            container.innerHTML = htmlText;
+            document.body.appendChild(container);
+
+            var range = document.createRange();
+            range.selectNodeContents(container);
+            var selection = window.getSelection();
+            selection.removeAllRanges();
+            selection.addRange(range);
+
+            var copied = document.execCommand('copy');
+            selection.removeAllRanges();
+            document.body.removeChild(container);
+
+            if (!copied) {{
                 var ta = document.createElement('textarea');
-                ta.value = text;
+                ta.value = plainText;
                 ta.style.cssText = 'position:fixed;opacity:0';
                 document.body.appendChild(ta);
                 ta.select();
                 document.execCommand('copy');
                 document.body.removeChild(ta);
-                showMsg();
             }}
+            showMsg();
         }}
         function showMsg() {{
             var msg = document.getElementById('copy-msg');
@@ -158,6 +204,71 @@ def _copy_button(results: list[dict]) -> None:
         """,
         height=50,
     )
+
+
+def _results_table_html(results: list[dict], include_styles: bool) -> str:
+    style_attr = ""
+    cell_style = ""
+    header_style = ""
+    if include_styles:
+        style_attr = (
+            ' style="border-collapse:collapse;width:100%;table-layout:fixed;'
+            'font-family:Arial,sans-serif;font-size:11pt;"'
+        )
+        cell_style = (
+            ' style="border:1px solid #d0d0d0;padding:6px;vertical-align:top;'
+            'white-space:pre-wrap;overflow-wrap:anywhere;word-break:break-word;"'
+        )
+        header_style = (
+            ' style="border:1px solid #d0d0d0;padding:6px;vertical-align:top;'
+            'white-space:pre-wrap;overflow-wrap:anywhere;word-break:break-word;'
+            'font-weight:bold;background:#f2f2f2;"'
+        )
+
+    rows = [
+        "<tr>"
+        f"<th{header_style}>Current Sentence</th>"
+        f"<th{header_style}>Suggestions</th>"
+        f"<th{header_style}>Issue</th>"
+        "</tr>"
+    ]
+    for r in results:
+        rows.append(
+            "<tr>"
+            f"<td{cell_style}>{_html_cell(r['sentence'])}</td>"
+            f"<td{cell_style}>{_html_cell(r['suggestion'])}</td>"
+            f"<td{cell_style}>{_html_cell(r['issue'])}</td>"
+            "</tr>"
+        )
+    return (
+        f"<table class=\"humanizer-results\"{style_attr}>"
+        "<colgroup><col><col><col></colgroup>"
+        f"{''.join(rows)}"
+        "</table>"
+    )
+
+
+def _html_cell(value: str) -> str:
+    return html.escape(str(value)).replace("\n", "<br>")
+
+
+def _results_table_tsv(results: list[dict]) -> str:
+    rows = ["\t".join(["Current Sentence", "Suggestions", "Issue"])]
+    for r in results:
+        rows.append(
+            "\t".join(
+                [
+                    _plain_cell(r["sentence"]),
+                    _plain_cell(r["suggestion"]),
+                    _plain_cell(r["issue"]),
+                ]
+            )
+        )
+    return "\n".join(rows)
+
+
+def _plain_cell(value: str) -> str:
+    return re.sub(r"[\t\r\n]+", " ", str(value)).strip()
 
 
 def _split_sentences(text: str) -> list[str]:
