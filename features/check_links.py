@@ -7,11 +7,12 @@ from features.auth import get_credentials, require_auth
 
 
 def render():
-    st.header("🔗 Check Links in Google Docs")
+    st.header("Check Internal & External Links in Google Docs")
     st.caption(
         "Checks which of your target URLs appear in a Google Doc, "
         "and identifies missing or duplicate links."
     )
+    _render_quick_guide()
 
     if not require_auth():
         return
@@ -39,6 +40,22 @@ def render():
         return
 
     _run_check(doc_url.strip(), urls_input)
+
+
+def _render_quick_guide():
+    with st.expander("How this works"):
+        st.markdown(
+            """
+1. Authenticate with Google in **Settings**.
+2. Paste the Google Doc URL you want to inspect.
+3. Paste the internal or external URLs you expect to find, one URL per line.
+4. Click **Check Links**.
+5. The app reads links from the document body, tables, headers, footers, footnotes, linked images, and rich links.
+6. Review three outputs: all links found, target URLs missing from the document, and duplicate links used more than once.
+
+Use this before publishing or updating SEO content to confirm important internal links and external citations are present.
+            """.strip()
+        )
 
 
 # ── helpers ──────────────────────────────────────────────────

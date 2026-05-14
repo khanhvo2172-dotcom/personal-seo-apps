@@ -24,14 +24,14 @@ from features import (
 
 st.title("Personal Tools")
 
-tab_settings, tab_humanizer, tab_kw, tab_autofill, tab_gdrive, tab_links, tab_extract = st.tabs([
+tab_settings, tab_humanizer, tab_links, tab_extract, tab_gdrive, tab_kw, tab_autofill = st.tabs([
     "Settings",
-    "Humanizer",
+    "Humanizer - AI detection",
+    "Check Internal & External Links in Google Docs",
+    "Extract & Optimize Images from Google Docs",
+    "Download Images using GDrive Links",
     "Keyword Grouping",
     "Autofill Column",
-    "Download GDrive Images",
-    "Check Links in GDocs",
-    "Extract & Optimize Images",
 ])
 
 with tab_settings:
@@ -40,17 +40,17 @@ with tab_settings:
 with tab_humanizer:
     humanizer.render()
 
-with tab_kw:
-    keyword_grouping.render()
-
-with tab_autofill:
-    autofill_column.render()
-
-with tab_gdrive:
-    download_gdrive_images.render()
-
 with tab_links:
     check_links.render()
 
 with tab_extract:
     extract_optimize_images.render()
+
+with tab_gdrive:
+    download_gdrive_images.render()
+
+with tab_kw:
+    keyword_grouping.render()
+
+with tab_autofill:
+    autofill_column.render()

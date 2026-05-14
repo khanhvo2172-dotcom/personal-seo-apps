@@ -66,8 +66,9 @@ REPLACEMENTS = [
 
 
 def render():
-    st.header("Humanizer")
+    st.header("Humanizer - AI detection")
     st.caption("Detects AI-writing patterns sentence by sentence and suggests cleaner rewrites.")
+    _render_quick_guide()
 
     text = st.text_area(
         "Paste text to analyze",
@@ -95,6 +96,21 @@ def render():
     st.subheader("Analysis Results")
     _render_results_table(results)
     _copy_button(results)
+
+
+def _render_quick_guide():
+    with st.expander("How this works"):
+        st.markdown(
+            """
+1. Paste text you want to check.
+2. Click **Analyze**.
+3. The app scans each sentence for common AI-writing signals such as vague claims, inflated wording, filler phrases, formulaic structures, and chatbot-style artifacts.
+4. For each flagged sentence, the app shows the original sentence, the issue, and a cleaner rewrite.
+5. Use **Copy table** to paste the results into Google Docs, Sheets, Excel, or your editor.
+
+If `DEEPSEEK_API_KEY` is available, suggestions use DeepSeek. If not, the app falls back to local rule-based rewrites.
+            """.strip()
+        )
 
 
 def _render_results_table(results: list[dict]) -> None:

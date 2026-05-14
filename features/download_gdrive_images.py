@@ -9,11 +9,12 @@ from urllib.parse import unquote
 
 
 def render():
-    st.header("📥 Download Google Drive Images")
+    st.header("Download Images using GDrive Links")
     st.caption(
         "Downloads images from Google Drive links and packages them into a ZIP. "
         "Files must be shared with **'Anyone with the link'**."
     )
+    _render_quick_guide()
 
     links_raw = st.text_area(
         "Google Drive Links — one per line",
@@ -32,6 +33,21 @@ def render():
             return
         links = [ln.strip() for ln in links_raw.splitlines() if ln.strip()]
         _run_download(links, zip_name.strip() or "downloaded_images")
+
+
+def _render_quick_guide():
+    with st.expander("How this works"):
+        st.markdown(
+            """
+1. Paste Google Drive image links, one link per line.
+2. Enter the ZIP filename you want.
+3. Click **Download & ZIP**.
+4. The app extracts each Google Drive file ID, downloads each image, and puts all successful downloads into one ZIP file.
+5. If a link fails, the app lists it so you can fix sharing permission or remove it.
+
+Public links should be shared as **Anyone with the link**. If you are authenticated in Settings, the app can also try the Google Drive API for files your account can access.
+            """.strip()
+        )
 
 
 # ── helpers ──────────────────────────────────────────────────
