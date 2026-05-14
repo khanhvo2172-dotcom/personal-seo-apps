@@ -12,6 +12,8 @@ st.set_page_config(
 
 if "google_creds" not in st.session_state:
     st.session_state.google_creds = None
+if "selected_feature" not in st.session_state:
+    st.session_state.selected_feature = "Settings"
 
 from features import (
     autofill_column,
@@ -57,10 +59,6 @@ def _apply_style():
             color: var(--app-muted);
         }
 
-        [data-testid="stSidebar"] .stRadio label {
-            padding: 0.3rem 0;
-        }
-
         .block-container {
             max-width: 1180px;
             padding-top: 2rem;
@@ -83,6 +81,24 @@ def _apply_style():
             border-radius: 8px;
             border: 1px solid var(--app-border);
         }
+
+        [data-testid="stSidebar"] .stButton > button {
+            width: 100%;
+            justify-content: flex-start;
+            background: transparent;
+            border: 1px solid transparent;
+            color: #334155;
+            font-weight: 500;
+            padding: 0.55rem 0.7rem;
+            text-align: left;
+        }
+
+        [data-testid="stSidebar"] .stButton > button:hover {
+            background: #f1f5f9;
+            border-color: #e2e8f0;
+            color: #0f172a;
+        }
+
         </style>
         """,
         unsafe_allow_html=True,
@@ -93,11 +109,18 @@ def _render_sidebar() -> str:
     with st.sidebar:
         st.title("Personal Tools")
         st.caption("SEO utilities")
-        return st.radio(
-            "Features",
-            list(FEATURES.keys()),
-            label_visibility="collapsed",
-        )
+        st.write("")
+        for feature_name in FEATURES:
+            is_active = st.session_state.selected_feature == feature_name
+            if st.button(
+                feature_name,
+                key=f"nav_{feature_name}",
+                type="primary" if is_active else "secondary",
+                use_container_width=True,
+            ):
+                st.session_state.selected_feature = feature_name
+                st.rerun()
+        return st.session_state.selected_feature
 
 
 _apply_style()
