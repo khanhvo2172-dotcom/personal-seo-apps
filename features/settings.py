@@ -18,7 +18,10 @@ def render():
 
     # ── Google Authentication ─────────────────────────────────
     st.subheader("🔑 Google Authentication")
-    st.info("Required for: **Check Links in GDocs** and **Extract & Optimize Images**")
+    st.info(
+        "Required for: **Check Links in GDocs**, **Extract & Optimize Images**, "
+        "and **Autofill Column** when using Google Sheets."
+    )
 
     col_path, col_status = st.columns([3, 1])
     with col_path:

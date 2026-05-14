@@ -13,6 +13,7 @@ if "google_creds" not in st.session_state:
     st.session_state.google_creds = None
 
 from features import (
+    autofill_column,
     check_links,
     download_gdrive_images,
     extract_optimize_images,
@@ -23,10 +24,11 @@ from features import (
 
 st.title("Personal Tools")
 
-tab_settings, tab_humanizer, tab_kw, tab_gdrive, tab_links, tab_extract = st.tabs([
+tab_settings, tab_humanizer, tab_kw, tab_autofill, tab_gdrive, tab_links, tab_extract = st.tabs([
     "Settings",
     "Humanizer",
     "Keyword Grouping",
+    "Autofill Column",
     "Download GDrive Images",
     "Check Links in GDocs",
     "Extract & Optimize Images",
@@ -40,6 +42,9 @@ with tab_humanizer:
 
 with tab_kw:
     keyword_grouping.render()
+
+with tab_autofill:
+    autofill_column.render()
 
 with tab_gdrive:
     download_gdrive_images.render()
