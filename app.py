@@ -84,12 +84,18 @@ def _apply_style():
 
         [data-testid="stSidebar"] .stButton > button {
             width: 100%;
+            display: flex;
             justify-content: flex-start;
             background: transparent;
             border: 1px solid transparent;
             color: #334155;
             font-weight: 500;
             padding: 0.55rem 0.7rem;
+            text-align: left;
+        }
+
+        [data-testid="stSidebar"] .stButton > button p {
+            width: 100%;
             text-align: left;
         }
 
