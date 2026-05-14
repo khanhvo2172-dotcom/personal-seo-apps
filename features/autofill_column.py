@@ -6,7 +6,7 @@ import pandas as pd
 import streamlit as st
 from googleapiclient.discovery import build
 
-from features.auth import get_credentials, require_auth
+from features.auth import get_credentials, require_sheets_auth
 
 
 SUPPORTED_UPLOAD_TYPES = ["csv", "xls", "xlsx"]
@@ -80,7 +80,7 @@ def _render_google_sheets_flow():
         "Google Sheets needs Google authentication with Sheets permission. "
         "If this fails, sign out in Settings and authenticate again."
     )
-    if not require_auth():
+    if not require_sheets_auth():
         return
 
     sheet_url = st.text_input(
