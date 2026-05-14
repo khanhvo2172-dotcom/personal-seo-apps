@@ -5,7 +5,7 @@ load_dotenv()
 
 st.set_page_config(
     page_title="Personal Tools",
-    page_icon="tools",
+    page_icon="🔷",
     layout="wide",
     initial_sidebar_state="expanded",
 )
@@ -40,23 +40,42 @@ def _apply_style():
     st.markdown(
         """
         <style>
+        @import url('https://fonts.googleapis.com/css2?family=Google+Sans:wght@400;500;700&family=Roboto:wght@300;400;500;700&display=swap');
+
         :root {
-            --app-border: rgba(15, 23, 42, 0.10);
-            --app-muted: #64748b;
-            --app-surface: #ffffff;
+            --g-blue: #4285F4;
+            --g-blue-dark: #1967D2;
+            --g-blue-light: #E8F0FE;
+            --g-text: #202124;
+            --g-text-muted: #5f6368;
+            --g-border: #dadce0;
+            --g-surface: #ffffff;
+            --g-bg: #f8f9fa;
+        }
+
+        html, body, [class*="css"], p, span, div, label, input, textarea, select {
+            font-family: 'Roboto', sans-serif !important;
+        }
+
+        h1, h2, h3, h4, h5, h6 {
+            font-family: 'Google Sans', 'Roboto', sans-serif !important;
+            font-weight: 500;
+            color: var(--g-text);
+            letter-spacing: 0;
         }
 
         .stApp {
-            background: #f8fafc;
+            background: var(--g-bg);
         }
 
         [data-testid="stSidebar"] {
-            background: #ffffff;
-            border-right: 1px solid var(--app-border);
+            background: var(--g-surface);
+            border-right: 1px solid var(--g-border);
         }
 
         [data-testid="stSidebar"] [data-testid="stMarkdownContainer"] p {
-            color: var(--app-muted);
+            color: var(--g-text-muted);
+            font-size: 12px;
         }
 
         .block-container {
@@ -65,21 +84,37 @@ def _apply_style():
             padding-bottom: 3rem;
         }
 
-        h1, h2, h3 {
-            letter-spacing: 0;
-        }
-
         div[data-testid="stExpander"],
         div[data-testid="stForm"] {
-            background: var(--app-surface);
-            border: 1px solid var(--app-border);
+            background: var(--g-surface);
+            border: 1px solid var(--g-border);
             border-radius: 8px;
+            box-shadow: 0 1px 2px rgba(60,64,67,.15), 0 2px 6px rgba(60,64,67,.1);
+        }
+
+        .stTextInput > div > div > input,
+        .stTextArea > div > div > textarea {
+            border: 1px solid var(--g-border);
+            border-radius: 4px;
+            color: var(--g-text);
+        }
+
+        .stTextInput > div > div > input:focus,
+        .stTextArea > div > div > textarea:focus {
+            border-color: var(--g-blue);
+            box-shadow: 0 0 0 2px rgba(66,133,244,.2);
+            outline: none;
         }
 
         .stButton > button,
         .stDownloadButton > button {
-            border-radius: 8px;
-            border: 1px solid var(--app-border);
+            font-family: 'Google Sans', 'Roboto', sans-serif !important;
+            font-weight: 500;
+            font-size: 14px;
+            letter-spacing: 0.25px;
+            border-radius: 4px;
+            border: 1px solid var(--g-border);
+            transition: background 0.2s, box-shadow 0.2s;
         }
 
         [data-testid="stSidebar"] .stButton > button {
@@ -88,11 +123,14 @@ def _apply_style():
             justify-content: flex-start !important;
             align-items: center;
             background: transparent;
-            border: 1px solid transparent;
-            color: #334155;
-            font-weight: 500;
-            padding: 0.55rem 0.7rem;
+            border: none;
+            border-radius: 24px;
+            color: var(--g-text);
+            font-weight: 400;
+            font-size: 14px;
+            padding: 0.5rem 1rem;
             text-align: left !important;
+            box-shadow: none;
         }
 
         [data-testid="stSidebar"] .stButton > button div,
@@ -109,9 +147,19 @@ def _apply_style():
         }
 
         [data-testid="stSidebar"] .stButton > button:hover {
-            background: #f1f5f9;
-            border-color: #e2e8f0;
-            color: #0f172a;
+            background: #f1f3f4 !important;
+            color: var(--g-text) !important;
+            box-shadow: none !important;
+        }
+
+        [data-testid="stSidebar"] .stButton > button[kind="primary"] {
+            background: var(--g-blue-light) !important;
+            color: var(--g-blue-dark) !important;
+            font-weight: 500 !important;
+        }
+
+        [data-testid="stSidebar"] .stButton > button[kind="primary"]:hover {
+            background: #d2e3fc !important;
         }
 
         </style>
@@ -122,8 +170,17 @@ def _apply_style():
 
 def _render_sidebar() -> str:
     with st.sidebar:
-        st.title("Personal Tools")
-        st.caption("SEO utilities")
+        st.markdown(
+            """
+            <div style="padding:8px 0 16px 0; border-bottom:1px solid #dadce0; margin-bottom:8px;">
+                <div style="font-family:'Google Sans','Roboto',sans-serif; font-size:20px; font-weight:500; color:#202124; line-height:1.3;">
+                    <span style="color:#4285F4">P</span><span style="color:#DB4437">e</span><span style="color:#F4B400">r</span><span style="color:#4285F4">s</span><span style="color:#0F9D58">o</span><span style="color:#DB4437">n</span><span style="color:#F4B400">a</span><span style="color:#4285F4">l</span>&nbsp;Tools
+                </div>
+                <div style="color:#5f6368; font-size:12px; margin-top:4px; font-family:'Roboto',sans-serif;">SEO utilities</div>
+            </div>
+            """,
+            unsafe_allow_html=True,
+        )
         st.write("")
         for feature_name in FEATURES:
             is_active = st.session_state.selected_feature == feature_name
