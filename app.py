@@ -53,8 +53,14 @@ def _apply_style():
             --g-bg: #f8f9fa;
         }
 
-        html, body, [class*="css"], p, span, div, label, input, textarea, select {
+        html, body, [class*="css"] {
             font-family: 'Roboto', sans-serif !important;
+        }
+
+        /* Exclude Material Icons spans from font override */
+        .material-icons, .material-symbols-rounded,
+        .material-symbols-outlined, [data-icon] {
+            font-family: 'Material Icons' !important;
         }
 
         h1, h2, h3, h4, h5, h6 {
