@@ -131,15 +131,10 @@ def render():
 
     st.subheader("Analysis Results")
     if usage:
-        results_col, cost_col = st.columns([2, 1])
-        with results_col:
-            _render_results_table(results)
-            _copy_button(results)
-        with cost_col:
-            _render_cost_summary(usage)
-    else:
-        _render_results_table(results)
-        _copy_button(results)
+        _render_cost_summary(usage)
+
+    _render_results_table(results)
+    _copy_button(results)
 
 
 def _render_quick_guide():
@@ -277,7 +272,7 @@ def _render_cost_summary(usage: dict) -> None:
             "Model": st.column_config.TextColumn("Model"),
             "Input tokens": st.column_config.NumberColumn("Input tokens", format="%d"),
             "Output tokens": st.column_config.NumberColumn("Output tokens", format="%d"),
-            "Est. Total Cost": st.column_config.TextColumn("Est. Total Cost"),
+            "Total Cost": st.column_config.TextColumn("Total Cost"),
         },
     )
 
@@ -291,12 +286,15 @@ def _cost_summary_rows(usage: dict) -> list[dict]:
     rows = []
     for model_key in model_order:
         total_cost = _estimate_cost(model_key, input_tokens, output_tokens)
+        model_label = MODEL_OPTIONS[model_key]["label"]
+        if model_key != used_model:
+            model_label = f"{model_label} (estimated)"
         rows.append(
             {
-                "Model": MODEL_OPTIONS[model_key]["label"],
+                "Model": model_label,
                 "Input tokens": input_tokens,
                 "Output tokens": output_tokens,
-                "Est. Total Cost": f"${total_cost:.6f}",
+                "Total Cost": f"${total_cost:.6f}",
             }
         )
     return rows
