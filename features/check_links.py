@@ -1,9 +1,14 @@
 import re
 import pandas as pd
+import requests
 import streamlit as st
 from collections import Counter
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from urllib.parse import urlsplit, urlunsplit
 from features.auth import get_credentials, require_auth
+
+STATUS_CHECK_TIMEOUT = 8
+STATUS_CHECK_WORKERS = 10
 
 
 def render():
@@ -160,19 +165,23 @@ def _run_check(doc_url: str, urls_input: str):
     url_counts = Counter(found_url_list)
     missing = sorted(target_urls - set(found_url_list))
     duplicates = sorted([(u, c) for u, c in url_counts.items() if c > 1], key=lambda x: -x[1])
+    status_urls = sorted({u for u, _ in unique} | target_urls)
+
+    with st.spinner("Checking URL status codes..."):
+        status_codes = _check_status_codes(status_urls)
 
     return {
-        "unique": unique,
+        "unique": [(u, a, status_codes.get(u, "N/A")) for u, a in unique],
         "target_count": len(target_urls),
-        "missing": missing,
-        "duplicates": duplicates,
+        "missing": [(u, status_codes.get(u, "N/A")) for u in missing],
+        "duplicates": [(u, c, status_codes.get(u, "N/A")) for u, c in duplicates],
     }
 
 
 def _render_results(results: dict):
-    unique = results["unique"]
-    missing = results["missing"]
-    duplicates = results["duplicates"]
+    unique = _with_status(results["unique"], "unique")
+    missing = _with_status(results["missing"], "missing")
+    duplicates = _with_status(results["duplicates"], "duplicates")
 
     st.success(
         f"Found **{len(unique)}** unique links in the document. "
@@ -181,39 +190,104 @@ def _render_results(results: dict):
 
     st.subheader("✅ All Links Found in Document")
     pd.set_option("display.max_colwidth", None)
-    df_found = pd.DataFrame(unique, columns=["🔗 Link", "💬 Anchor Text"])
+    df_found = pd.DataFrame(unique, columns=["🔗 Link", "💬 Anchor Text", "Status Code"])
     df_found = _filter_dataframe(
         df_found,
-        st.text_input("Filter all links", key="check_links_filter_found"),
+        _render_filter(
+            "Filter all links",
+            "check_links_filter_found",
+            "Type part of a URL, anchor text, or status code...",
+        ),
     )
-    st.dataframe(df_found, use_container_width=True)
+    _render_selectable_table(
+        df_found,
+        "check_links_table_found",
+    )
 
     col1, col2 = st.columns(2)
 
     with col1:
         st.subheader("🚫 Missing Links")
         if missing:
-            df_missing = pd.DataFrame(missing, columns=["URL"])
+            df_missing = pd.DataFrame(missing, columns=["URL", "Status Code"])
             df_missing = _filter_dataframe(
                 df_missing,
-                st.text_input("Filter missing links", key="check_links_filter_missing"),
+                _render_filter(
+                    "Filter missing links",
+                    "check_links_filter_missing",
+                    "Type part of a URL or status code...",
+                ),
             )
-            st.dataframe(df_missing, use_container_width=True)
+            _render_selectable_table(
+                df_missing,
+                "check_links_table_missing",
+            )
         else:
             st.success("All target URLs are present in the document.")
 
     with col2:
         st.subheader("🔁 Duplicate Links (> 1 occurrence)")
         if duplicates:
-            st.dataframe(
-                _filter_dataframe(
-                    pd.DataFrame(duplicates, columns=["URL", "Count"]),
-                    st.text_input("Filter duplicate links", key="check_links_filter_duplicates"),
+            df_duplicates = _filter_dataframe(
+                pd.DataFrame(duplicates, columns=["URL", "Count", "Status Code"]),
+                _render_filter(
+                    "Filter duplicate links",
+                    "check_links_filter_duplicates",
+                    "Type part of a URL, count, or status code...",
                 ),
-                use_container_width=True,
+            )
+            _render_selectable_table(
+                df_duplicates,
+                "check_links_table_duplicates",
             )
         else:
             st.success("No duplicate links found.")
+
+
+def _render_filter(label: str, key: str, placeholder: str) -> str:
+    st.markdown(
+        f"""
+        <div style="
+            margin: 0.35rem 0 0.25rem 0;
+            padding: 0.65rem 0.8rem;
+            border: 2px solid #f59e0b;
+            border-radius: 8px;
+            background: #fffbeb;
+            color: #78350f;
+            font-weight: 700;
+        ">
+            FILTER TABLE: {label}
+        </div>
+        """,
+        unsafe_allow_html=True,
+    )
+    return st.text_input(label, key=key, placeholder=placeholder, label_visibility="collapsed")
+
+
+def _with_status(rows: list, table_type: str) -> list:
+    normalized = []
+    for row in rows:
+        if table_type == "missing":
+            if isinstance(row, str):
+                normalized.append((row, "N/A"))
+            else:
+                normalized.append(row if len(row) >= 2 else (row[0], "N/A"))
+        elif table_type == "duplicates":
+            normalized.append(row if len(row) >= 3 else (row[0], row[1], "N/A"))
+        else:
+            normalized.append(row if len(row) >= 3 else (row[0], row[1], "N/A"))
+    return normalized
+
+
+def _render_selectable_table(df: pd.DataFrame, key: str):
+    st.dataframe(
+        df,
+        use_container_width=True,
+        hide_index=True,
+        key=key,
+        on_select="rerun",
+        selection_mode="multi-row",
+    )
 
 
 def _filter_dataframe(df: pd.DataFrame, query: str) -> pd.DataFrame:
@@ -226,3 +300,40 @@ def _filter_dataframe(df: pd.DataFrame, query: str) -> pd.DataFrame:
         axis=1,
     )
     return df[matches]
+
+
+def _check_status_codes(urls: list[str]) -> dict[str, str]:
+    if not urls:
+        return {}
+
+    results = {}
+    with ThreadPoolExecutor(max_workers=STATUS_CHECK_WORKERS) as executor:
+        futures = {executor.submit(_check_status_code, url): url for url in urls}
+        for future in as_completed(futures):
+            url = futures[future]
+            try:
+                results[url] = future.result()
+            except Exception:
+                results[url] = "Error"
+    return results
+
+
+def _check_status_code(url: str) -> str:
+    try:
+        response = requests.head(
+            url,
+            allow_redirects=True,
+            timeout=STATUS_CHECK_TIMEOUT,
+            headers={"User-Agent": "Mozilla/5.0"},
+        )
+        if response.status_code in (403, 405):
+            response = requests.get(
+                url,
+                allow_redirects=True,
+                timeout=STATUS_CHECK_TIMEOUT,
+                headers={"User-Agent": "Mozilla/5.0"},
+                stream=True,
+            )
+        return str(response.status_code)
+    except requests.RequestException:
+        return "Error"
