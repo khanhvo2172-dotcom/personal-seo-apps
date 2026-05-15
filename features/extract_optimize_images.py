@@ -43,11 +43,11 @@ def render():
         with col2:
             width = st.number_input("Width (px)", value=1200, min_value=1, step=10)
         with col3:
-            height = st.number_input("Height (px)", value=600, min_value=1, step=10)
+            height = st.number_input("Height (px)", value=1000, min_value=1, step=10)
         with col4:
-            fmt = st.selectbox("Format", [".jpg", ".jpeg", ".png", ".webp"], index=2)
+            fmt = st.selectbox("Format", [".jpg", ".jpeg", ".png", ".webp"], index=3)
 
-        quality = st.slider("Quality (JPG / WebP lossy)", min_value=1, max_value=100, value=80)
+        quality = st.slider("Quality (JPG / WebP lossy)", min_value=1, max_value=100, value=90)
         skip_upscale = st.checkbox(
             "Skip resize if image is already smaller than target dimensions", value=True
         )

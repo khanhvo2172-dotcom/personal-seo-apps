@@ -29,17 +29,20 @@ def render():
         )
         submitted = st.form_submit_button("🔍 Check Links", type="primary")
 
-    if not submitted:
-        return
+    if submitted:
+        if not doc_url.strip():
+            st.error("Please provide a Google Doc URL.")
+            return
+        if not urls_input.strip():
+            st.error("Please provide at least one URL to check.")
+            return
 
-    if not doc_url.strip():
-        st.error("Please provide a Google Doc URL.")
-        return
-    if not urls_input.strip():
-        st.error("Please provide at least one URL to check.")
-        return
+        results = _run_check(doc_url.strip(), urls_input)
+        if results:
+            st.session_state["check_links_results"] = results
 
-    _run_check(doc_url.strip(), urls_input)
+    if "check_links_results" in st.session_state:
+        _render_results(st.session_state["check_links_results"])
 
 
 def _render_quick_guide():
@@ -139,7 +142,7 @@ def _run_check(doc_url: str, urls_input: str):
                 st.error(f"Document not found (404). Check the URL.")
             else:
                 st.error(f"Failed to fetch document: {e}")
-            return
+            return None
 
     # Collect links from body, headers, footers, footnotes
     raw: list = []
@@ -158,14 +161,31 @@ def _run_check(doc_url: str, urls_input: str):
     missing = sorted(target_urls - set(found_url_list))
     duplicates = sorted([(u, c) for u, c in url_counts.items() if c > 1], key=lambda x: -x[1])
 
+    return {
+        "unique": unique,
+        "target_count": len(target_urls),
+        "missing": missing,
+        "duplicates": duplicates,
+    }
+
+
+def _render_results(results: dict):
+    unique = results["unique"]
+    missing = results["missing"]
+    duplicates = results["duplicates"]
+
     st.success(
         f"Found **{len(unique)}** unique links in the document. "
-        f"Checked **{len(target_urls)}** target URLs."
+        f"Checked **{results['target_count']}** target URLs."
     )
 
     st.subheader("✅ All Links Found in Document")
     pd.set_option("display.max_colwidth", None)
     df_found = pd.DataFrame(unique, columns=["🔗 Link", "💬 Anchor Text"])
+    df_found = _filter_dataframe(
+        df_found,
+        st.text_input("Filter all links", key="check_links_filter_found"),
+    )
     st.dataframe(df_found, use_container_width=True)
 
     col1, col2 = st.columns(2)
@@ -173,7 +193,12 @@ def _run_check(doc_url: str, urls_input: str):
     with col1:
         st.subheader("🚫 Missing Links")
         if missing:
-            st.dataframe(pd.DataFrame(missing, columns=["URL"]), use_container_width=True)
+            df_missing = pd.DataFrame(missing, columns=["URL"])
+            df_missing = _filter_dataframe(
+                df_missing,
+                st.text_input("Filter missing links", key="check_links_filter_missing"),
+            )
+            st.dataframe(df_missing, use_container_width=True)
         else:
             st.success("All target URLs are present in the document.")
 
@@ -181,8 +206,23 @@ def _run_check(doc_url: str, urls_input: str):
         st.subheader("🔁 Duplicate Links (> 1 occurrence)")
         if duplicates:
             st.dataframe(
-                pd.DataFrame(duplicates, columns=["URL", "Count"]),
+                _filter_dataframe(
+                    pd.DataFrame(duplicates, columns=["URL", "Count"]),
+                    st.text_input("Filter duplicate links", key="check_links_filter_duplicates"),
+                ),
                 use_container_width=True,
             )
         else:
             st.success("No duplicate links found.")
+
+
+def _filter_dataframe(df: pd.DataFrame, query: str) -> pd.DataFrame:
+    query = (query or "").strip()
+    if not query or df.empty:
+        return df
+
+    matches = df.astype(str).apply(
+        lambda row: row.str.contains(query, case=False, na=False, regex=False).any(),
+        axis=1,
+    )
+    return df[matches]
