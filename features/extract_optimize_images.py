@@ -18,8 +18,9 @@ CLOUDINARY_TEMP_FOLDER = "gdocs_extractor_temp"
 
 
 def render():
-    st.header("🖼️ Extract & Optimize Images from Google Docs")
+    st.header("Extract & Optimize Images from Google Docs")
     st.caption("Extracts all images from a Google Doc, optimizes them, and downloads a ZIP.")
+    _render_quick_guide()
 
     if not require_auth():
         return
@@ -72,6 +73,22 @@ def render():
         filename_base.strip() or "image",
         int(width), int(height), fmt, quality, skip_upscale, webp_lossless,
     )
+
+
+def _render_quick_guide():
+    with st.expander("How this works"):
+        st.markdown(
+            """
+1. Authenticate with Google in **Settings**.
+2. Paste a Google Docs URL.
+3. Choose whether to extract images from the current tab or all document tabs.
+4. Set filename base, target width/height, output format, and quality.
+5. Click **Extract & Optimize**.
+6. The app downloads images from the document, resizes/optimizes them, and packages all processed files into a ZIP.
+
+PNG/JPG optimization runs locally. WebP uses Cloudinary for better output quality, so Cloudinary credentials are required when choosing `.webp`.
+            """.strip()
+        )
 
 
 # ── Document helpers ──────────────────────────────────────────

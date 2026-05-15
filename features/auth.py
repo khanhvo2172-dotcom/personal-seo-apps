@@ -6,10 +6,12 @@ import streamlit as st
 from google.oauth2.credentials import Credentials
 from google.auth.transport.requests import Request
 
-SCOPES = [
+BASE_SCOPES = [
     "https://www.googleapis.com/auth/documents.readonly",
     "https://www.googleapis.com/auth/drive.readonly",
 ]
+SHEETS_SCOPE = "https://www.googleapis.com/auth/spreadsheets"
+SCOPES = BASE_SCOPES + [SHEETS_SCOPE]
 
 TOKEN_PATH = Path("token.json")
 
@@ -49,7 +51,7 @@ def _load_credentials_from_env() -> Credentials | None:
     if not token_info:
         return None
     try:
-        creds = Credentials.from_authorized_user_info(token_info, SCOPES)
+        creds = Credentials.from_authorized_user_info(token_info)
         if creds.expired and creds.refresh_token:
             creds.refresh(Request())
         return creds if creds.valid else None
@@ -66,7 +68,7 @@ def load_credentials() -> Credentials | None:
     if not TOKEN_PATH.exists():
         return None
     try:
-        creds = Credentials.from_authorized_user_file(str(TOKEN_PATH), SCOPES)
+        creds = Credentials.from_authorized_user_file(str(TOKEN_PATH))
         if creds.expired and creds.refresh_token:
             creds.refresh(Request())
             TOKEN_PATH.write_text(creds.to_json())
@@ -105,5 +107,20 @@ def require_auth() -> bool:
     st.warning(
         "⚠️ Google authentication required. "
         "Please go to the **⚙️ Settings** tab and click **Authenticate with Google**."
+    )
+    return False
+
+
+def require_sheets_auth() -> bool:
+    """Show a warning and return False when the token does not include Sheets access."""
+    creds = get_credentials()
+    if not creds:
+        return require_auth()
+    if creds.has_scopes([SHEETS_SCOPE]):
+        return True
+    st.warning(
+        "Google Sheets permission is missing. "
+        "Sign out in **Settings**, authenticate again, then update `GOOGLE_TOKEN_JSON` "
+        "in Streamlit Secrets with the new token."
     )
     return False

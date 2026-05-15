@@ -13,12 +13,16 @@ def _save(key: str, value: str):
 
 
 def render():
-    st.header("⚙️ Settings")
+    st.header("Settings")
     load_dotenv(str(ENV_PATH), override=True)
+    _render_quick_guide()
 
     # ── Google Authentication ─────────────────────────────────
     st.subheader("🔑 Google Authentication")
-    st.info("Required for: **Check Links in GDocs** and **Extract & Optimize Images**")
+    st.info(
+        "Required for: **Check Links in GDocs**, **Extract & Optimize Images**, "
+        "and **Autofill Column** when using Google Sheets."
+    )
 
     col_path, col_status = st.columns([3, 1])
     with col_path:
@@ -102,6 +106,22 @@ def render():
 
     # Silently restore saved credentials on first load
     _auto_load_token()
+
+
+def _render_quick_guide():
+    with st.expander("How this works"):
+        st.markdown(
+            """
+Use this tab to save private API keys and Google authentication used by other tools.
+
+1. Add Google OAuth credentials to use Google Docs, Google Drive, and Google Sheets features.
+2. Add a Serper API key for **Keyword Grouping**.
+3. Add Cloudinary credentials when you want WebP output in **Extract & Optimize Images from Google Docs**.
+4. On Streamlit Cloud or Railway, save these values in private app secrets or environment variables instead of committing them to GitHub.
+
+After changing Google permissions, sign out and authenticate again so Google grants the new access scope.
+            """.strip()
+        )
 
 
 def _auto_load_token():

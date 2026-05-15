@@ -7,6 +7,32 @@ A Streamlit web app with personal SEO utilities:
 - Google Docs link checking
 - Google Docs image extraction and optimization
 - Cloudinary-based WebP optimization
+- Excel / Google Sheets column autofill
+
+## Autofill Column
+
+Open the **Autofill Column** tab to fill blank cells in one column from the last value above it.
+Autofill only continues while the selected limit column has data; when the limit column is blank,
+the carry-forward value resets.
+
+For Excel or CSV:
+
+1. Upload a `.xlsx`, `.xls`, or `.csv` file.
+2. Select the column to autofill.
+3. Select the limit column.
+4. Click **Autofill Column**.
+5. Download the new file. The app adds a new `<column>_autofilled` column and keeps the original column unchanged.
+
+For Google Sheets:
+
+1. Authenticate with Google in **Settings**.
+2. Open **Autofill Column** and choose **Google Sheets**.
+3. Paste the Google Sheets URL or spreadsheet ID.
+4. Enter the sheet tab name, then load the sheet.
+5. Select the columns and click **Autofill Column**.
+6. Click **Write autofilled column to Google Sheet** to add or update the `<column>_autofilled` column.
+
+If Google Sheets auth fails after this update, sign out in **Settings** and authenticate again so the app can request Sheets permission.
 
 ## Local Run
 

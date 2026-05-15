@@ -10,8 +10,9 @@ load_dotenv()
 
 
 def render():
-    st.header("🔑 Keyword Grouping")
+    st.header("Keyword Grouping")
     st.caption("Groups keywords based on shared Top 5 SERP results via serper.dev")
+    _render_quick_guide()
 
     saved_key = os.getenv("SERP_API_KEY", "")
 
@@ -53,6 +54,23 @@ def render():
         return
 
     _run_grouping(api_key, keywords, location.strip(), language.strip(), device, threshold)
+
+
+def _render_quick_guide():
+    with st.expander("How this works"):
+        st.markdown(
+            """
+1. Add your Serper API key in **Settings** or paste it here.
+2. Paste keywords, one keyword per line. Put higher-volume or more important keywords first.
+3. Choose Google location, language, device, and the common URL threshold.
+4. Click **Start Grouping**.
+5. The app gets the top 5 Google results for each keyword.
+6. Keywords are grouped together when they share enough top-ranking URLs.
+7. Download the final keyword-to-topic mapping as a tab-separated text file.
+
+Use a lower threshold for broader groups and a higher threshold for tighter SERP overlap.
+            """.strip()
+        )
 
 
 # ── helpers ──────────────────────────────────────────────────
