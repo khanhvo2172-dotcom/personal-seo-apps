@@ -561,29 +561,39 @@ def _suggest_with_openai(flagged: list[dict], api_key: str) -> list[dict] | None
 
     try:
         response = requests.post(
-            "https://api.openai.com/v1/chat/completions",
+            "https://api.openai.com/v1/responses",
             headers={
                 "Authorization": f"Bearer {api_key}",
                 "Content-Type": "application/json",
             },
             json={
                 "model": model,
-                "messages": [
-                    {"role": "system", "content": system_prompt},
-                    {"role": "user", "content": user_prompt},
-                ],
-                "temperature": 0.4,
-                "max_completion_tokens": 2500,
+                "instructions": system_prompt,
+                "input": user_prompt,
+                "reasoning": {"effort": "none"},
+                "max_output_tokens": 2500,
             },
             timeout=60,
         )
         response.raise_for_status()
         data = response.json()
-        raw = data["choices"][0]["message"]["content"].strip()
+        raw = _openai_response_text(data)
         return _apply_model_suggestions(flagged, raw)
     except Exception as exc:
         st.warning(f"ChatGPT request failed: {exc}. Falling back to rule-based suggestions.")
         return None
+
+
+def _openai_response_text(data: dict) -> str:
+    if data.get("output_text"):
+        return str(data["output_text"]).strip()
+
+    parts: list[str] = []
+    for item in data.get("output", []):
+        for content in item.get("content", []):
+            if content.get("type") in {"output_text", "text"}:
+                parts.append(str(content.get("text", "")))
+    return "".join(parts).strip()
 
 
 def _private_value(key: str) -> str:
