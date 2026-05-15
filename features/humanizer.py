@@ -37,6 +37,12 @@ MODEL_OPTIONS = {
     },
 }
 
+COST_RATES_PER_MILLION = {
+    "deepseek": {"input": 0.435, "output": 0.87},
+    "claude": {"input": 3.0, "output": 15.0},
+    "openai": {"input": 5.0, "output": 30.0},
+}
+
 
 RULES = [
     PatternRule("Inflated significance", r"\b(serves as|stands as|testament|pivotal|crucial|underscores?|highlights?|broader|evolving landscape|lasting impact|indelible mark)\b", "Adds fake importance or broad claims."),
@@ -121,11 +127,19 @@ def render():
         return
 
     with st.spinner("Generating suggestions..."):
-        results = _get_suggestions(flagged, model_choice)
+        results, usage = _get_suggestions(flagged, model_choice)
 
     st.subheader("Analysis Results")
-    _render_results_table(results)
-    _copy_button(results)
+    if usage:
+        results_col, cost_col = st.columns([2, 1])
+        with results_col:
+            _render_results_table(results)
+            _copy_button(results)
+        with cost_col:
+            _render_cost_summary(usage)
+    else:
+        _render_results_table(results)
+        _copy_button(results)
 
 
 def _render_quick_guide():
@@ -252,6 +266,50 @@ def _copy_button(results: list[dict]) -> None:
     )
 
 
+def _render_cost_summary(usage: dict) -> None:
+    st.markdown("**Cost summary**")
+    st.caption("Other models are estimated using the same token counts from this run.")
+    st.dataframe(
+        _cost_summary_rows(usage),
+        hide_index=True,
+        use_container_width=True,
+        column_config={
+            "Model": st.column_config.TextColumn("Model"),
+            "Input tokens": st.column_config.NumberColumn("Input tokens", format="%d"),
+            "Output tokens": st.column_config.NumberColumn("Output tokens", format="%d"),
+            "Est. Total Cost": st.column_config.TextColumn("Est. Total Cost"),
+        },
+    )
+
+
+def _cost_summary_rows(usage: dict) -> list[dict]:
+    used_model = usage["model_choice"]
+    model_order = [used_model] + [key for key in MODEL_OPTIONS if key != used_model]
+    input_tokens = int(usage.get("input_tokens", 0))
+    output_tokens = int(usage.get("output_tokens", 0))
+
+    rows = []
+    for model_key in model_order:
+        total_cost = _estimate_cost(model_key, input_tokens, output_tokens)
+        rows.append(
+            {
+                "Model": MODEL_OPTIONS[model_key]["label"],
+                "Input tokens": input_tokens,
+                "Output tokens": output_tokens,
+                "Est. Total Cost": f"${total_cost:.6f}",
+            }
+        )
+    return rows
+
+
+def _estimate_cost(model_key: str, input_tokens: int, output_tokens: int) -> float:
+    rates = COST_RATES_PER_MILLION[model_key]
+    return (
+        (input_tokens * rates["input"] / 1_000_000)
+        + (output_tokens * rates["output"] / 1_000_000)
+    )
+
+
 def _results_table_html(results: list[dict], include_styles: bool) -> str:
     style_attr = ""
     cell_style = ""
@@ -340,7 +398,7 @@ def _flag_sentences(sentences: list[str]) -> list[dict]:
     return flagged
 
 
-def _get_suggestions(flagged: list[dict], model_choice: str) -> list[dict]:
+def _get_suggestions(flagged: list[dict], model_choice: str) -> tuple[list[dict], dict | None]:
     model_config = MODEL_OPTIONS.get(model_choice, MODEL_OPTIONS["deepseek"])
     api_key = _private_value(model_config["api_key"])
     if api_key:
@@ -355,7 +413,7 @@ def _get_suggestions(flagged: list[dict], model_choice: str) -> list[dict]:
         )
     for item in flagged:
         item["suggestion"] = _apply_replacements(item["sentence"])
-    return flagged
+    return flagged, None
 
 
 def _apply_replacements(sentence: str) -> str:
@@ -367,7 +425,7 @@ def _apply_replacements(sentence: str) -> str:
     return out.strip()
 
 
-def _suggest_with_model(flagged: list[dict], model_choice: str, api_key: str) -> list[dict] | None:
+def _suggest_with_model(flagged: list[dict], model_choice: str, api_key: str) -> tuple[list[dict], dict] | None:
     if model_choice == "claude":
         return _suggest_with_claude(flagged, api_key)
     if model_choice == "openai":
@@ -486,7 +544,7 @@ def _apply_model_suggestions(flagged: list[dict], raw: str) -> list[dict]:
     return flagged
 
 
-def _suggest_with_deepseek(flagged: list[dict], api_key: str) -> list[dict] | None:
+def _suggest_with_deepseek(flagged: list[dict], api_key: str) -> tuple[list[dict], dict] | None:
     system_prompt, user_prompt = _build_prompts(flagged)
     model = _private_value("DEEPSEEK_MODEL") or MODEL_OPTIONS["deepseek"]["default_model"]
 
@@ -513,13 +571,14 @@ def _suggest_with_deepseek(flagged: list[dict], api_key: str) -> list[dict] | No
         response.raise_for_status()
         data = response.json()
         raw = data["choices"][0]["message"]["content"].strip()
-        return _apply_model_suggestions(flagged, raw)
+        results = _apply_model_suggestions(flagged, raw)
+        return results, _usage_payload("deepseek", data.get("usage", {}))
     except Exception as exc:
         st.warning(f"DeepSeek request failed: {exc}. Falling back to rule-based suggestions.")
         return None
 
 
-def _suggest_with_claude(flagged: list[dict], api_key: str) -> list[dict] | None:
+def _suggest_with_claude(flagged: list[dict], api_key: str) -> tuple[list[dict], dict] | None:
     system_prompt, user_prompt = _build_prompts(flagged)
     model = _private_value("ANTHROPIC_MODEL") or MODEL_OPTIONS["claude"]["default_model"]
 
@@ -549,13 +608,14 @@ def _suggest_with_claude(flagged: list[dict], api_key: str) -> list[dict] | None
             for block in data.get("content", [])
             if block.get("type") == "text"
         )
-        return _apply_model_suggestions(flagged, raw)
+        results = _apply_model_suggestions(flagged, raw)
+        return results, _usage_payload("claude", data.get("usage", {}))
     except Exception as exc:
         st.warning(f"Claude request failed: {exc}. Falling back to rule-based suggestions.")
         return None
 
 
-def _suggest_with_openai(flagged: list[dict], api_key: str) -> list[dict] | None:
+def _suggest_with_openai(flagged: list[dict], api_key: str) -> tuple[list[dict], dict] | None:
     system_prompt, user_prompt = _build_prompts(flagged)
     model = _private_value("OPENAI_MODEL") or MODEL_OPTIONS["openai"]["default_model"]
 
@@ -578,10 +638,21 @@ def _suggest_with_openai(flagged: list[dict], api_key: str) -> list[dict] | None
         response.raise_for_status()
         data = response.json()
         raw = _openai_response_text(data)
-        return _apply_model_suggestions(flagged, raw)
+        results = _apply_model_suggestions(flagged, raw)
+        return results, _usage_payload("openai", data.get("usage", {}))
     except Exception as exc:
         st.warning(f"ChatGPT request failed: {exc}. Falling back to rule-based suggestions.")
         return None
+
+
+def _usage_payload(model_choice: str, usage: dict) -> dict:
+    input_tokens = usage.get("prompt_tokens", usage.get("input_tokens", 0))
+    output_tokens = usage.get("completion_tokens", usage.get("output_tokens", 0))
+    return {
+        "model_choice": model_choice,
+        "input_tokens": int(input_tokens or 0),
+        "output_tokens": int(output_tokens or 0),
+    }
 
 
 def _openai_response_text(data: dict) -> str:
