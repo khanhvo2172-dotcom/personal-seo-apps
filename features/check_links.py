@@ -1,7 +1,10 @@
 import re
+import html
+import json
 import pandas as pd
 import requests
 import streamlit as st
+import streamlit.components.v1 as components
 from collections import Counter
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from urllib.parse import urlsplit, urlunsplit
@@ -202,6 +205,7 @@ def _render_results(results: dict):
     _render_selectable_table(
         df_found,
         "check_links_table_found",
+        "All links",
     )
 
     col1, col2 = st.columns(2)
@@ -221,6 +225,7 @@ def _render_results(results: dict):
             _render_selectable_table(
                 df_missing,
                 "check_links_table_missing",
+                "Missing links",
             )
         else:
             st.success("All target URLs are present in the document.")
@@ -239,29 +244,29 @@ def _render_results(results: dict):
             _render_selectable_table(
                 df_duplicates,
                 "check_links_table_duplicates",
+                "Duplicate links",
             )
         else:
             st.success("No duplicate links found.")
 
 
 def _render_filter(label: str, key: str, placeholder: str) -> str:
-    st.markdown(
-        f"""
-        <div style="
-            margin: 0.35rem 0 0.25rem 0;
-            padding: 0.65rem 0.8rem;
-            border: 2px solid #f59e0b;
-            border-radius: 8px;
-            background: #fffbeb;
-            color: #78350f;
-            font-weight: 700;
-        ">
-            FILTER TABLE: {label}
-        </div>
-        """,
-        unsafe_allow_html=True,
-    )
-    return st.text_input(label, key=key, placeholder=placeholder, label_visibility="collapsed")
+    icon_col, input_col = st.columns([0.06, 0.94], vertical_alignment="bottom")
+    with icon_col:
+        st.markdown(
+            """
+            <div style="height: 38px; display: flex; align-items: center;">
+                <svg width="18" height="18" viewBox="0 0 24 24" fill="none"
+                     stroke="#4b5563" stroke-width="2" stroke-linecap="round"
+                     stroke-linejoin="round" aria-label="Filter">
+                    <polygon points="22 3 2 3 10 12.46 10 19 14 21 14 12.46 22 3"></polygon>
+                </svg>
+            </div>
+            """,
+            unsafe_allow_html=True,
+        )
+    with input_col:
+        return st.text_input(label, key=key, placeholder=placeholder, label_visibility="collapsed")
 
 
 def _with_status(rows: list, table_type: str) -> list:
@@ -279,7 +284,7 @@ def _with_status(rows: list, table_type: str) -> list:
     return normalized
 
 
-def _render_selectable_table(df: pd.DataFrame, key: str):
+def _render_selectable_table(df: pd.DataFrame, key: str, label: str):
     st.dataframe(
         df,
         use_container_width=True,
@@ -288,6 +293,12 @@ def _render_selectable_table(df: pd.DataFrame, key: str):
         on_select="rerun",
         selection_mode="multi-row",
     )
+    with st.expander(f"Copy cells from {label}"):
+        components.html(
+            _copy_cells_table_html(df, key),
+            height=_copy_cells_table_height(df),
+            scrolling=True,
+        )
 
 
 def _filter_dataframe(df: pd.DataFrame, query: str) -> pd.DataFrame:
@@ -300,6 +311,153 @@ def _filter_dataframe(df: pd.DataFrame, query: str) -> pd.DataFrame:
         axis=1,
     )
     return df[matches]
+
+
+def _copy_cells_table_height(df: pd.DataFrame) -> int:
+    return min(520, max(220, 125 + (min(len(df), 10) * 36)))
+
+
+def _copy_cells_table_html(df: pd.DataFrame, key: str) -> str:
+    columns = [str(col) for col in df.columns]
+    rows = df.astype(str).values.tolist()
+    table_id = f"copy-cells-{key}"
+    rows_json = json.dumps(rows)
+
+    header_html = "".join(f"<th>{html.escape(col)}</th>" for col in columns)
+    body_html = []
+    for row_index, row in enumerate(rows):
+        cells = []
+        for col_index, value in enumerate(row):
+            cells.append(
+                f'<td data-row="{row_index}" data-col="{col_index}">{html.escape(value)}</td>'
+            )
+        body_html.append(f"<tr>{''.join(cells)}</tr>")
+
+    return f"""
+    <style>
+        #{table_id} {{
+            font-family: Arial, sans-serif;
+            color: #111827;
+        }}
+        #{table_id} .copy-toolbar {{
+            display: flex;
+            align-items: center;
+            gap: 8px;
+            margin-bottom: 8px;
+        }}
+        #{table_id} button {{
+            border: 1px solid #d1d5db;
+            border-radius: 6px;
+            background: #ffffff;
+            color: #111827;
+            padding: 6px 10px;
+            cursor: pointer;
+        }}
+        #{table_id} .copy-status {{
+            font-size: 12px;
+            color: #4b5563;
+        }}
+        #{table_id} .copy-table-wrap {{
+            max-height: 390px;
+            overflow: auto;
+            border: 1px solid #e5e7eb;
+            border-radius: 8px;
+        }}
+        #{table_id} table {{
+            width: 100%;
+            border-collapse: collapse;
+            table-layout: fixed;
+            font-size: 13px;
+        }}
+        #{table_id} th,
+        #{table_id} td {{
+            border-bottom: 1px solid #e5e7eb;
+            border-right: 1px solid #e5e7eb;
+            padding: 8px;
+            text-align: left;
+            vertical-align: top;
+            overflow-wrap: anywhere;
+            user-select: none;
+        }}
+        #{table_id} th {{
+            position: sticky;
+            top: 0;
+            background: #f9fafb;
+            z-index: 1;
+        }}
+        #{table_id} td.selected {{
+            background: #dbeafe;
+            outline: 2px solid #2563eb;
+            outline-offset: -2px;
+        }}
+    </style>
+    <div id="{table_id}">
+        <div class="copy-toolbar">
+            <button type="button" class="copy-selected">Copy selected cells</button>
+            <button type="button" class="clear-selected">Clear</button>
+            <span class="copy-status">No cells selected.</span>
+        </div>
+        <div class="copy-table-wrap">
+            <table>
+                <thead><tr>{header_html}</tr></thead>
+                <tbody>{''.join(body_html)}</tbody>
+            </table>
+        </div>
+    </div>
+    <script>
+        const root = document.getElementById({json.dumps(table_id)});
+        const data = {rows_json};
+        const selected = new Set();
+        const status = root.querySelector(".copy-status");
+
+        function selectionKey(cell) {{
+            return cell.dataset.row + "," + cell.dataset.col;
+        }}
+
+        root.querySelectorAll("td").forEach((cell) => {{
+            cell.addEventListener("click", (event) => {{
+                if (!event.ctrlKey && !event.metaKey) {{
+                    selected.clear();
+                    root.querySelectorAll("td.selected").forEach((el) => el.classList.remove("selected"));
+                }}
+
+                const key = selectionKey(cell);
+                if (selected.has(key)) {{
+                    selected.delete(key);
+                    cell.classList.remove("selected");
+                }} else {{
+                    selected.add(key);
+                    cell.classList.add("selected");
+                }}
+                status.textContent = selected.size + " cell(s) selected.";
+            }});
+        }});
+
+        root.querySelector(".clear-selected").addEventListener("click", () => {{
+            selected.clear();
+            root.querySelectorAll("td.selected").forEach((el) => el.classList.remove("selected"));
+            status.textContent = "No cells selected.";
+        }});
+
+        root.querySelector(".copy-selected").addEventListener("click", async () => {{
+            const values = Array.from(selected).map((key) => {{
+                const [row, col] = key.split(",").map(Number);
+                return data[row][col];
+            }});
+            if (!values.length) {{
+                status.textContent = "No cells selected.";
+                return;
+            }}
+
+            try {{
+                await navigator.clipboard.writeText(values.join("\\n"));
+                status.textContent = "Copied " + values.length + " cell(s).";
+            }} catch (error) {{
+                status.textContent = values.join("\\n");
+            }}
+        }});
+    </script>
+    """
 
 
 def _check_status_codes(urls: list[str]) -> dict[str, str]:
