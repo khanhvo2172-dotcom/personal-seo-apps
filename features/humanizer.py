@@ -16,6 +16,28 @@ class PatternRule:
     issue: str
 
 
+MODEL_OPTIONS = {
+    "deepseek": {
+        "label": "DeepSeek V4 Pro",
+        "api_key": "DEEPSEEK_API_KEY",
+        "model_key": "DEEPSEEK_MODEL",
+        "default_model": "deepseek-v4-pro",
+    },
+    "claude": {
+        "label": "Claude 4.6",
+        "api_key": "ANTHROPIC_API_KEY",
+        "model_key": "ANTHROPIC_MODEL",
+        "default_model": "claude-sonnet-4-20250514",
+    },
+    "openai": {
+        "label": "ChatGPT 5.5",
+        "api_key": "OPENAI_API_KEY",
+        "model_key": "OPENAI_MODEL",
+        "default_model": "gpt-5-chat-latest",
+    },
+}
+
+
 RULES = [
     PatternRule("Inflated significance", r"\b(serves as|stands as|testament|pivotal|crucial|underscores?|highlights?|broader|evolving landscape|lasting impact|indelible mark)\b", "Adds fake importance or broad claims."),
     PatternRule("Promotional language", r"\b(boasts?|vibrant|rich cultural|profound|showcas(?:e|es|ing)|renowned|breathtaking|must-visit|stunning|groundbreaking)\b", "Sounds like marketing copy."),
@@ -69,6 +91,14 @@ def render():
     st.header("Humanizer")
     st.caption("Detects AI-writing patterns sentence by sentence and suggests cleaner rewrites.")
 
+    model_choice = st.radio(
+        "AI model",
+        options=list(MODEL_OPTIONS.keys()),
+        format_func=lambda key: MODEL_OPTIONS[key]["label"],
+        horizontal=True,
+        help="Choose which model generates the rewrite suggestions.",
+    )
+
     text = st.text_area(
         "Paste text to analyze",
         height=280,
@@ -90,7 +120,7 @@ def render():
         return
 
     with st.spinner("Generating suggestions..."):
-        results = _get_suggestions(flagged)
+        results = _get_suggestions(flagged, model_choice)
 
     st.subheader("Analysis Results")
     _render_results_table(results)
@@ -294,12 +324,19 @@ def _flag_sentences(sentences: list[str]) -> list[dict]:
     return flagged
 
 
-def _get_suggestions(flagged: list[dict]) -> list[dict]:
-    api_key = _private_value("DEEPSEEK_API_KEY")
+def _get_suggestions(flagged: list[dict], model_choice: str) -> list[dict]:
+    model_config = MODEL_OPTIONS.get(model_choice, MODEL_OPTIONS["deepseek"])
+    api_key = _private_value(model_config["api_key"])
     if api_key:
-        result = _suggest_with_deepseek(flagged, api_key)
+        result = _suggest_with_model(flagged, model_choice, api_key)
         if result:
             return result
+    else:
+        st.info(
+            f"{model_config['label']} API key not found. "
+            f"Set {model_config['api_key']} in Streamlit secrets or environment variables. "
+            "Using rule-based suggestions for now."
+        )
     for item in flagged:
         item["suggestion"] = _apply_replacements(item["sentence"])
     return flagged
@@ -314,7 +351,15 @@ def _apply_replacements(sentence: str) -> str:
     return out.strip()
 
 
-def _suggest_with_deepseek(flagged: list[dict], api_key: str) -> list[dict] | None:
+def _suggest_with_model(flagged: list[dict], model_choice: str, api_key: str) -> list[dict] | None:
+    if model_choice == "claude":
+        return _suggest_with_claude(flagged, api_key)
+    if model_choice == "openai":
+        return _suggest_with_openai(flagged, api_key)
+    return _suggest_with_deepseek(flagged, api_key)
+
+
+def _build_prompts(flagged: list[dict]) -> tuple[str, str]:
     sentences_block = "\n".join(
         f"{i + 1}. {item['sentence']}" for i, item in enumerate(flagged)
     )
@@ -411,6 +456,23 @@ Return ONLY a JSON array. Each element: {"index": <1-based int>, "suggestion": "
 Do not explain your changes. Return valid JSON only."""
 
     user_prompt = f"Rewrite these sentences:\n{sentences_block}"
+    return system_prompt, user_prompt
+
+
+def _apply_model_suggestions(flagged: list[dict], raw: str) -> list[dict]:
+    raw = raw.strip()
+    raw = re.sub(r"^```(?:json)?\s*", "", raw)
+    raw = re.sub(r"\s*```$", "", raw)
+    parsed = json.loads(raw)
+    for i, item in enumerate(flagged):
+        match = next((x for x in parsed if x.get("index") == i + 1), None)
+        item["suggestion"] = match["suggestion"] if match else _apply_replacements(item["sentence"])
+    return flagged
+
+
+def _suggest_with_deepseek(flagged: list[dict], api_key: str) -> list[dict] | None:
+    system_prompt, user_prompt = _build_prompts(flagged)
+    model = _private_value("DEEPSEEK_MODEL") or MODEL_OPTIONS["deepseek"]["default_model"]
 
     try:
         response = requests.post(
@@ -420,7 +482,7 @@ Do not explain your changes. Return valid JSON only."""
                 "Content-Type": "application/json",
             },
             json={
-                "model": "deepseek-v4-pro",
+                "model": model,
                 "messages": [
                     {"role": "system", "content": system_prompt},
                     {"role": "user", "content": user_prompt},
@@ -435,15 +497,76 @@ Do not explain your changes. Return valid JSON only."""
         response.raise_for_status()
         data = response.json()
         raw = data["choices"][0]["message"]["content"].strip()
-        raw = re.sub(r"^```(?:json)?\s*", "", raw)
-        raw = re.sub(r"\s*```$", "", raw)
-        parsed = json.loads(raw)
-        for i, item in enumerate(flagged):
-            match = next((x for x in parsed if x.get("index") == i + 1), None)
-            item["suggestion"] = match["suggestion"] if match else _apply_replacements(item["sentence"])
-        return flagged
+        return _apply_model_suggestions(flagged, raw)
     except Exception as exc:
         st.warning(f"DeepSeek request failed: {exc}. Falling back to rule-based suggestions.")
+        return None
+
+
+def _suggest_with_claude(flagged: list[dict], api_key: str) -> list[dict] | None:
+    system_prompt, user_prompt = _build_prompts(flagged)
+    model = _private_value("ANTHROPIC_MODEL") or MODEL_OPTIONS["claude"]["default_model"]
+
+    try:
+        response = requests.post(
+            "https://api.anthropic.com/v1/messages",
+            headers={
+                "x-api-key": api_key,
+                "anthropic-version": "2023-06-01",
+                "Content-Type": "application/json",
+            },
+            json={
+                "model": model,
+                "system": system_prompt,
+                "messages": [
+                    {"role": "user", "content": user_prompt},
+                ],
+                "temperature": 0.4,
+                "max_tokens": 2500,
+            },
+            timeout=60,
+        )
+        response.raise_for_status()
+        data = response.json()
+        raw = "".join(
+            block.get("text", "")
+            for block in data.get("content", [])
+            if block.get("type") == "text"
+        )
+        return _apply_model_suggestions(flagged, raw)
+    except Exception as exc:
+        st.warning(f"Claude request failed: {exc}. Falling back to rule-based suggestions.")
+        return None
+
+
+def _suggest_with_openai(flagged: list[dict], api_key: str) -> list[dict] | None:
+    system_prompt, user_prompt = _build_prompts(flagged)
+    model = _private_value("OPENAI_MODEL") or MODEL_OPTIONS["openai"]["default_model"]
+
+    try:
+        response = requests.post(
+            "https://api.openai.com/v1/chat/completions",
+            headers={
+                "Authorization": f"Bearer {api_key}",
+                "Content-Type": "application/json",
+            },
+            json={
+                "model": model,
+                "messages": [
+                    {"role": "system", "content": system_prompt},
+                    {"role": "user", "content": user_prompt},
+                ],
+                "temperature": 0.4,
+                "max_completion_tokens": 2500,
+            },
+            timeout=60,
+        )
+        response.raise_for_status()
+        data = response.json()
+        raw = data["choices"][0]["message"]["content"].strip()
+        return _apply_model_suggestions(flagged, raw)
+    except Exception as exc:
+        st.warning(f"ChatGPT request failed: {exc}. Falling back to rule-based suggestions.")
         return None
 
 
