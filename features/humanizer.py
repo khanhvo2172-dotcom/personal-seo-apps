@@ -264,16 +264,9 @@ def _copy_button(results: list[dict]) -> None:
 def _render_cost_summary(usage: dict) -> None:
     st.markdown("**Cost summary**")
     st.caption("Other models are estimated using the same token counts from this run.")
-    st.dataframe(
-        _cost_summary_rows(usage),
-        hide_index=True,
-        use_container_width=True,
-        column_config={
-            "Model": st.column_config.TextColumn("Model"),
-            "Input tokens": st.column_config.NumberColumn("Input tokens", format="%d"),
-            "Output tokens": st.column_config.NumberColumn("Output tokens", format="%d"),
-            "Total Cost": st.column_config.TextColumn("Total Cost"),
-        },
+    st.markdown(
+        _cost_summary_table_html(_cost_summary_rows(usage)),
+        unsafe_allow_html=True,
     )
 
 
@@ -306,6 +299,61 @@ def _estimate_cost(model_key: str, input_tokens: int, output_tokens: int) -> flo
         (input_tokens * rates["input"] / 1_000_000)
         + (output_tokens * rates["output"] / 1_000_000)
     )
+
+
+def _cost_summary_table_html(rows: list[dict]) -> str:
+    table_rows = [
+        "<tr>"
+        "<th>Model</th>"
+        "<th>Input tokens</th>"
+        "<th>Output tokens</th>"
+        "<th>Total Cost</th>"
+        "</tr>"
+    ]
+    for row in rows:
+        table_rows.append(
+            "<tr>"
+            f"<td>{_html_cell(row['Model'])}</td>"
+            f"<td>{_html_cell(row['Input tokens'])}</td>"
+            f"<td>{_html_cell(row['Output tokens'])}</td>"
+            f"<td>{_html_cell(row['Total Cost'])}</td>"
+            "</tr>"
+        )
+
+    return f"""
+        <style>
+            .humanizer-cost-summary {{
+                width: 100%;
+                border-collapse: collapse;
+                table-layout: fixed;
+                font-size: 0.92rem;
+                margin-bottom: 1rem;
+            }}
+            .humanizer-cost-summary th,
+            .humanizer-cost-summary td {{
+                border: 1px solid rgba(49, 51, 63, 0.18);
+                padding: 0.55rem 0.7rem;
+                vertical-align: middle;
+                overflow-wrap: anywhere;
+                word-break: break-word;
+            }}
+            .humanizer-cost-summary th {{
+                background: rgba(49, 51, 63, 0.06);
+                font-weight: 600;
+            }}
+            .humanizer-cost-summary th:first-child,
+            .humanizer-cost-summary td:first-child {{
+                text-align: left;
+            }}
+            .humanizer-cost-summary th:not(:first-child),
+            .humanizer-cost-summary td:not(:first-child) {{
+                text-align: center;
+            }}
+        </style>
+        <table class="humanizer-cost-summary">
+            {''.join(table_rows)}
+        </table>
+    """
 
 
 def _results_table_html(results: list[dict], include_styles: bool) -> str:
