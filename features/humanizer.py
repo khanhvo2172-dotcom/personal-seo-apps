@@ -33,7 +33,7 @@ MODEL_OPTIONS = {
         "label": "ChatGPT 5.5",
         "api_key": "OPENAI_API_KEY",
         "model_key": "OPENAI_MODEL",
-        "default_model": "gpt-5-chat-latest",
+        "default_model": "gpt-5.5",
     },
 }
 
