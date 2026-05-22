@@ -1,13 +1,14 @@
+import json
+import os
 import re
 import html
-import json
 import pandas as pd
 import requests
 import streamlit as st
 import streamlit.components.v1 as components
 from collections import Counter
 from concurrent.futures import ThreadPoolExecutor, as_completed
-from urllib.parse import urlsplit, urlunsplit
+from urllib.parse import urlsplit, urlunsplit, unquote
 from features.auth import get_credentials, require_auth
 
 STATUS_CHECK_TIMEOUT = 8
@@ -32,7 +33,10 @@ def render():
         )
         urls_input = st.text_area(
             "URLs to check — one per line",
-            placeholder="https://www.example.com/page-1\nhttps://www.example.com/page-2",
+            placeholder=(
+                "https://www.example.com/page-1 | Page 1 title\n"
+                "https://www.example.com/page-2"
+            ),
             height=150,
         )
         submitted = st.form_submit_button("🔍 Check Links", type="primary")
@@ -60,9 +64,10 @@ def _render_quick_guide():
 1. Authenticate with Google in **Settings**.
 2. Paste the Google Doc URL you want to inspect.
 3. Paste the internal or external URLs you expect to find, one URL per line.
-4. Click **Check Links**.
-5. The app reads links from the document body, tables, headers, footers, footnotes, linked images, and rich links.
-6. Review three outputs: all links found, target URLs missing from the document, and duplicate links used more than once.
+4. Add optional page titles after each URL with `|`, tab, comma, or ` - `.
+5. Click **Check Links**.
+6. The app reads links from the document body, tables, headers, footers, footnotes, linked images, and rich links.
+7. Review outputs: all links found, target URLs missing from the document, duplicate links, and DeepSeek anchor text suggestions for missing links.
 
 Use this before publishing or updating SEO content to confirm important internal links and external citations are present.
             """.strip()
@@ -111,6 +116,30 @@ def _find_links(elements: list, found: list):
             _find_links(el["tableOfContents"].get("content", []), found)
 
 
+def _extract_text(elements: list, chunks: list):
+    """Recursively extract readable text from document elements."""
+    for el in elements:
+        if "paragraph" in el:
+            text = []
+            for pe in el["paragraph"].get("elements", []):
+                if "textRun" in pe:
+                    text.append(pe["textRun"].get("content", ""))
+                elif "richLink" in pe:
+                    props = pe["richLink"].get("richLinkProperties", {}) or {}
+                    title = (props.get("title") or props.get("uri") or "").strip()
+                    if title:
+                        text.append(title)
+            paragraph = "".join(text).strip()
+            if paragraph:
+                chunks.append(paragraph)
+        elif "table" in el:
+            for row in el["table"].get("tableRows", []):
+                for cell in row.get("tableCells", []):
+                    _extract_text(cell.get("content", []), chunks)
+        elif "tableOfContents" in el:
+            _extract_text(el["tableOfContents"].get("content", []), chunks)
+
+
 def _merge_adjacent(raw: list) -> list:
     """Merge anchor text fragments that belong to the same link run."""
     if not raw:
@@ -124,6 +153,49 @@ def _merge_adjacent(raw: list) -> list:
             cur_url, cur_anchor = url, anchor
     merged.append((cur_url, cur_anchor.strip()))
     return merged
+
+
+def _parse_target_urls(urls_input: str) -> dict[str, str]:
+    targets: dict[str, str] = {}
+    for raw_line in urls_input.strip().splitlines():
+        line = raw_line.strip()
+        if not line:
+            continue
+
+        url_match = re.search(r"https?://\S+", line)
+        if not url_match:
+            continue
+
+        raw_url = url_match.group(0).rstrip("),.;]")
+        title = ""
+        before = line[: url_match.start()].strip(" \t-|,:")
+        after = line[url_match.end() :].strip(" \t-|,:")
+
+        if after:
+            title = after
+        elif before:
+            title = before
+
+        targets[_normalize(raw_url)] = title or _title_from_url(raw_url)
+    return targets
+
+
+def _title_from_url(url: str) -> str:
+    parts = urlsplit(url)
+    path = unquote(parts.path.rstrip("/"))
+    slug = path.rsplit("/", 1)[-1] if path else parts.netloc
+    slug = re.sub(r"[-_]+", " ", slug)
+    slug = re.sub(r"\s+", " ", slug).strip()
+    return slug.title() if slug else url
+
+
+def _document_text(doc: dict) -> str:
+    chunks: list[str] = []
+    _extract_text(doc.get("body", {}).get("content", []), chunks)
+    for part in ("footnotes", "headers", "footers"):
+        for item in doc.get(part, {}).values():
+            _extract_text(item.get("content", []), chunks)
+    return "\n\n".join(chunks)
 
 
 def _run_check(doc_url: str, urls_input: str):
@@ -163,7 +235,8 @@ def _run_check(doc_url: str, urls_input: str):
     normalized = [(n, a) for u, a in merged if (n := _normalize(u))]
     unique = list(dict.fromkeys(normalized))
 
-    target_urls = {_normalize(u) for u in urls_input.strip().splitlines() if u.strip()}
+    target_url_titles = _parse_target_urls(urls_input)
+    target_urls = set(target_url_titles)
     found_url_list = [u for u, _ in normalized]
     url_counts = Counter(found_url_list)
     missing = sorted(target_urls - set(found_url_list))
@@ -176,8 +249,15 @@ def _run_check(doc_url: str, urls_input: str):
     return {
         "unique": [(u, a, status_codes.get(u, "N/A")) for u, a in unique],
         "target_count": len(target_urls),
-        "missing": [(u, status_codes.get(u, "N/A")) for u in missing],
+        "missing": [
+            (u, target_url_titles.get(u, ""), status_codes.get(u, "N/A"))
+            for u in missing
+        ],
         "duplicates": [(u, c, status_codes.get(u, "N/A")) for u, c in duplicates],
+        "deepseek_suggestions": _get_deepseek_suggestions(
+            doc,
+            [{"url": u, "title": target_url_titles.get(u, "")} for u in missing],
+        ),
     }
 
 
@@ -213,13 +293,13 @@ def _render_results(results: dict):
     with col1:
         st.subheader("🚫 Missing Links")
         if missing:
-            df_missing = pd.DataFrame(missing, columns=["URL", "Status Code"])
+            df_missing = pd.DataFrame(missing, columns=["URL", "Title", "Status Code"])
             df_missing = _filter_dataframe(
                 df_missing,
                 _render_filter(
                     "Filter missing links",
                     "check_links_filter_missing",
-                    "Type part of a URL or status code...",
+                    "Type part of a URL, title, or status code...",
                 ),
             )
             _render_selectable_table(
@@ -249,6 +329,23 @@ def _render_results(results: dict):
         else:
             st.success("No duplicate links found.")
 
+    suggestions = results.get("deepseek_suggestions")
+    if suggestions:
+        st.subheader("DeepSeek Suggestions for Missing Links")
+        df_suggestions = _filter_dataframe(
+            pd.DataFrame(suggestions),
+            _render_filter(
+                "Filter DeepSeek suggestions",
+                "check_links_filter_deepseek",
+                "Type part of a URL, anchor text, or recommendation...",
+            ),
+        )
+        _render_selectable_table(
+            df_suggestions,
+            "check_links_table_deepseek",
+            "DeepSeek suggestions",
+        )
+
 
 def _render_filter(label: str, key: str, placeholder: str) -> str:
     icon_col, input_col = st.columns([0.06, 0.94], vertical_alignment="bottom")
@@ -274,9 +371,14 @@ def _with_status(rows: list, table_type: str) -> list:
     for row in rows:
         if table_type == "missing":
             if isinstance(row, str):
-                normalized.append((row, "N/A"))
+                normalized.append((row, "", "N/A"))
             else:
-                normalized.append(row if len(row) >= 2 else (row[0], "N/A"))
+                if len(row) >= 3:
+                    normalized.append(row)
+                elif len(row) == 2:
+                    normalized.append((row[0], "", row[1]))
+                else:
+                    normalized.append((row[0], "", "N/A"))
         elif table_type == "duplicates":
             normalized.append(row if len(row) >= 3 else (row[0], row[1], "N/A"))
         else:
@@ -495,3 +597,105 @@ def _check_status_code(url: str) -> str:
         return str(response.status_code)
     except requests.RequestException:
         return "Error"
+
+
+def _get_deepseek_suggestions(doc: dict, missing_targets: list[dict]) -> list[dict]:
+    if not missing_targets:
+        return []
+
+    api_key = _private_value("DEEPSEEK_API_KEY")
+    if not api_key:
+        st.warning("Add DEEPSEEK_API_KEY to enable anchor text suggestions.")
+        return []
+
+    doc_text = _document_text(doc)
+    with st.spinner("Asking DeepSeek for anchor text recommendations..."):
+        return _suggest_missing_links(doc_text, missing_targets, api_key) or []
+
+
+def _suggest_missing_links(doc_text: str, missing_targets: list[dict], api_key: str) -> list[dict] | None:
+    links_block = "\n".join(
+        f"{i + 1}. URL: {item['url']}\n   Title: {item.get('title') or '(no title)'}"
+        for i, item in enumerate(missing_targets)
+    )
+
+    system_prompt = """You are an SEO editor recommending where to insert missing internal or external links into an existing article.
+
+Rules:
+1. Prefer an in-text link using natural anchor text that already appears in the content.
+2. Do not use only the exact URL slug as anchor text. Make the anchor natural for readers.
+3. If no relevant anchor text exists, suggest a slight edit to current text and show the edited anchor text.
+4. If a URL is too hard to place naturally, mark it as "Hard to embed".
+5. Each URL must be embedded only once.
+6. Do not invent facts that are not supported by the content or URL title.
+
+Return ONLY a valid JSON array. Each item must have:
+{
+  "url": "...",
+  "title": "...",
+  "status": "Use existing text" | "Slight edit needed" | "Hard to embed",
+  "anchor_text": "...",
+  "where_to_insert": "short quote or nearby sentence from the content",
+  "recommendation": "short instruction for the editor"
+}
+Do not wrap JSON in markdown."""
+
+    user_prompt = f"""Full Google Doc content:
+{doc_text}
+
+Missing URLs and titles:
+{links_block}"""
+
+    try:
+        response = requests.post(
+            "https://api.deepseek.com/chat/completions",
+            headers={
+                "Authorization": f"Bearer {api_key}",
+                "Content-Type": "application/json",
+            },
+            json={
+                "model": "deepseek-v4-pro",
+                "messages": [
+                    {"role": "system", "content": system_prompt},
+                    {"role": "user", "content": user_prompt},
+                ],
+                "thinking": {"type": "disabled"},
+                "temperature": 0.2,
+                "max_tokens": 3500,
+                "stream": False,
+            },
+            timeout=90,
+        )
+        response.raise_for_status()
+        data = response.json()
+        raw = data["choices"][0]["message"]["content"].strip()
+        raw = re.sub(r"^```(?:json)?\s*", "", raw)
+        raw = re.sub(r"\s*```$", "", raw)
+        parsed = json.loads(raw)
+        if not isinstance(parsed, list):
+            raise ValueError("DeepSeek did not return a JSON array.")
+        return [_normalize_suggestion_row(item) for item in parsed]
+    except Exception as exc:
+        st.error(f"DeepSeek request failed: {exc}")
+        return None
+
+
+def _normalize_suggestion_row(item: dict) -> dict:
+    return {
+        "URL": str(item.get("url", "")).strip(),
+        "Title": str(item.get("title", "")).strip(),
+        "Status": str(item.get("status", "")).strip(),
+        "Suggested Anchor Text": str(item.get("anchor_text", "")).strip(),
+        "Where to Insert": str(item.get("where_to_insert", "")).strip(),
+        "Recommendation": str(item.get("recommendation", "")).strip(),
+    }
+
+
+def _private_value(key: str) -> str:
+    value = os.getenv(key, "").strip()
+    if value:
+        return value
+    try:
+        return str(st.secrets.get(key, "")).strip()
+    except Exception:
+        return ""
