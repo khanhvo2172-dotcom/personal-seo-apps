@@ -67,7 +67,8 @@ def _render_quick_guide():
 4. Add optional page titles after each URL with `|`, tab, comma, or ` - `.
 5. Click **Check Links**.
 6. The app reads links from the document body, tables, headers, footers, footnotes, linked images, and rich links.
-7. Review outputs: all links found, target URLs missing from the document, duplicate links, and DeepSeek anchor text suggestions for missing links.
+7. Review all links found, target URLs missing from the document, and duplicate links.
+8. Use the DeepSeek button only when you want anchor text suggestions for missing links.
 
 Use this before publishing or updating SEO content to confirm important internal links and external citations are present.
             """.strip()
@@ -254,10 +255,12 @@ def _run_check(doc_url: str, urls_input: str):
             for u in missing
         ],
         "duplicates": [(u, c, status_codes.get(u, "N/A")) for u, c in duplicates],
-        "deepseek_suggestions": _get_deepseek_suggestions(
-            doc,
-            [{"url": u, "title": target_url_titles.get(u, "")} for u in missing],
-        ),
+        "deepseek_doc_text": _document_text(doc),
+        "deepseek_missing_targets": [
+            {"url": u, "title": target_url_titles.get(u, "")}
+            for u in missing
+        ],
+        "deepseek_suggestions": [],
     }
 
 
@@ -329,15 +332,24 @@ def _render_results(results: dict):
         else:
             st.success("No duplicate links found.")
 
+    missing_targets = results.get("deepseek_missing_targets") or []
+    if missing_targets:
+        st.subheader("DeepSeek Suggestions for Missing Links")
+        if st.button("Ask DeepSeek for anchor text suggestions", type="secondary"):
+            results["deepseek_suggestions"] = _get_deepseek_suggestions(
+                results.get("deepseek_doc_text", ""),
+                missing_targets,
+            )
+            st.session_state["check_links_results"] = results
+
     suggestions = results.get("deepseek_suggestions")
     if suggestions:
-        st.subheader("DeepSeek Suggestions for Missing Links")
         df_suggestions = _filter_dataframe(
             pd.DataFrame(suggestions),
             _render_filter(
                 "Filter DeepSeek suggestions",
                 "check_links_filter_deepseek",
-                "Type part of a URL, anchor text, or recommendation...",
+                "Type part of a URL, title, status, or anchor text...",
             ),
         )
         _render_selectable_table(
@@ -599,7 +611,7 @@ def _check_status_code(url: str) -> str:
         return "Error"
 
 
-def _get_deepseek_suggestions(doc: dict, missing_targets: list[dict]) -> list[dict]:
+def _get_deepseek_suggestions(doc_text: str, missing_targets: list[dict]) -> list[dict]:
     if not missing_targets:
         return []
 
@@ -608,7 +620,6 @@ def _get_deepseek_suggestions(doc: dict, missing_targets: list[dict]) -> list[di
         st.warning("Add DEEPSEEK_API_KEY to enable anchor text suggestions.")
         return []
 
-    doc_text = _document_text(doc)
     with st.spinner("Asking DeepSeek for anchor text recommendations..."):
         return _suggest_missing_links(doc_text, missing_targets, api_key) or []
 
@@ -624,19 +635,18 @@ def _suggest_missing_links(doc_text: str, missing_targets: list[dict], api_key: 
 Rules:
 1. Prefer an in-text link using natural anchor text that already appears in the content.
 2. Do not use only the exact URL slug as anchor text. Make the anchor natural for readers.
-3. If no relevant anchor text exists, suggest a slight edit to current text and show the edited anchor text.
-4. If a URL is too hard to place naturally, mark it as "Hard to embed".
-5. Each URL must be embedded only once.
-6. Do not invent facts that are not supported by the content or URL title.
+3. The anchor text must match the target page's SEO intent based on its URL and title.
+4. If no relevant anchor text exists, suggest a slight edit to current text and show the edited anchor text.
+5. If a URL is too hard to place naturally, mark it as "Hard to embed".
+6. Each URL must be embedded only once.
+7. Do not invent facts that are not supported by the content or URL title.
 
 Return ONLY a valid JSON array. Each item must have:
 {
   "url": "...",
   "title": "...",
   "status": "Use existing text" | "Slight edit needed" | "Hard to embed",
-  "anchor_text": "...",
-  "where_to_insert": "short quote or nearby sentence from the content",
-  "recommendation": "short instruction for the editor"
+  "anchor_text": "..."
 }
 Do not wrap JSON in markdown."""
 
@@ -686,8 +696,6 @@ def _normalize_suggestion_row(item: dict) -> dict:
         "Title": str(item.get("title", "")).strip(),
         "Status": str(item.get("status", "")).strip(),
         "Suggested Anchor Text": str(item.get("anchor_text", "")).strip(),
-        "Where to Insert": str(item.get("where_to_insert", "")).strip(),
-        "Recommendation": str(item.get("recommendation", "")).strip(),
     }
 
 
