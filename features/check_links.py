@@ -13,6 +13,7 @@ from features.auth import get_credentials, require_auth
 
 STATUS_CHECK_TIMEOUT = 8
 STATUS_CHECK_WORKERS = 10
+CLAUDE_DEFAULT_MODEL = "claude-sonnet-4-20250514"
 
 
 def render():
@@ -68,7 +69,7 @@ def _render_quick_guide():
 5. Click **Check Links**.
 6. The app reads links from the document body, tables, headers, footers, footnotes, linked images, and rich links.
 7. Review all links found, target URLs missing from the document, and duplicate links.
-8. Use the DeepSeek button only when you want anchor text suggestions for missing links.
+8. Use the DeepSeek or Claude 4.6 button only when you want anchor text suggestions for missing links.
 
 Use this before publishing or updating SEO content to confirm important internal links and external citations are present.
             """.strip()
@@ -261,6 +262,7 @@ def _run_check(doc_url: str, urls_input: str):
             for u in missing
         ],
         "deepseek_suggestions": [],
+        "claude_suggestions": [],
     }
 
 
@@ -334,13 +336,22 @@ def _render_results(results: dict):
 
     missing_targets = results.get("deepseek_missing_targets") or []
     if missing_targets:
-        st.subheader("DeepSeek Suggestions for Missing Links")
-        if st.button("Ask DeepSeek for anchor text suggestions", type="secondary"):
-            results["deepseek_suggestions"] = _get_deepseek_suggestions(
-                results.get("deepseek_doc_text", ""),
-                missing_targets,
-            )
-            st.session_state["check_links_results"] = results
+        st.subheader("AI Suggestions for Missing Links")
+        deepseek_col, claude_col = st.columns(2)
+        with deepseek_col:
+            if st.button("Ask DeepSeek for anchor text suggestions", type="secondary"):
+                results["deepseek_suggestions"] = _get_deepseek_suggestions(
+                    results.get("deepseek_doc_text", ""),
+                    missing_targets,
+                )
+                st.session_state["check_links_results"] = results
+        with claude_col:
+            if st.button("Ask Claude 4.6 for anchor text suggestions", type="secondary"):
+                results["claude_suggestions"] = _get_claude_suggestions(
+                    results.get("deepseek_doc_text", ""),
+                    missing_targets,
+                )
+                st.session_state["check_links_results"] = results
 
     suggestions = results.get("deepseek_suggestions")
     if suggestions:
@@ -356,6 +367,23 @@ def _render_results(results: dict):
             df_suggestions,
             "check_links_table_deepseek",
             "DeepSeek suggestions",
+        )
+
+    claude_suggestions = results.get("claude_suggestions")
+    if claude_suggestions:
+        st.subheader("Claude 4.6 Suggestions for Missing Links")
+        df_claude_suggestions = _filter_dataframe(
+            pd.DataFrame(claude_suggestions),
+            _render_filter(
+                "Filter Claude 4.6 suggestions",
+                "check_links_filter_claude",
+                "Type part of a URL, title, status, or anchor text...",
+            ),
+        )
+        _render_selectable_table(
+            df_claude_suggestions,
+            "check_links_table_claude",
+            "Claude 4.6 suggestions",
         )
 
 
@@ -624,7 +652,20 @@ def _get_deepseek_suggestions(doc_text: str, missing_targets: list[dict]) -> lis
         return _suggest_missing_links(doc_text, missing_targets, api_key) or []
 
 
-def _suggest_missing_links(doc_text: str, missing_targets: list[dict], api_key: str) -> list[dict] | None:
+def _get_claude_suggestions(doc_text: str, missing_targets: list[dict]) -> list[dict]:
+    if not missing_targets:
+        return []
+
+    api_key = _private_value("ANTHROPIC_API_KEY")
+    if not api_key:
+        st.warning("Add ANTHROPIC_API_KEY to enable Claude 4.6 anchor text suggestions.")
+        return []
+
+    with st.spinner("Asking Claude 4.6 for anchor text recommendations..."):
+        return _suggest_missing_links_with_claude(doc_text, missing_targets, api_key) or []
+
+
+def _build_missing_links_prompt(doc_text: str, missing_targets: list[dict]) -> tuple[str, str]:
     links_block = "\n".join(
         f"{i + 1}. URL: {item['url']}\n   Title: {item.get('title') or '(no title)'}"
         for i, item in enumerate(missing_targets)
@@ -656,6 +697,12 @@ Do not wrap JSON in markdown."""
 Missing URLs and titles:
 {links_block}"""
 
+    return system_prompt, user_prompt
+
+
+def _suggest_missing_links(doc_text: str, missing_targets: list[dict], api_key: str) -> list[dict] | None:
+    system_prompt, user_prompt = _build_missing_links_prompt(doc_text, missing_targets)
+
     try:
         response = requests.post(
             "https://api.deepseek.com/chat/completions",
@@ -679,15 +726,60 @@ Missing URLs and titles:
         response.raise_for_status()
         data = response.json()
         raw = data["choices"][0]["message"]["content"].strip()
-        raw = re.sub(r"^```(?:json)?\s*", "", raw)
-        raw = re.sub(r"\s*```$", "", raw)
-        parsed = json.loads(raw)
-        if not isinstance(parsed, list):
-            raise ValueError("DeepSeek did not return a JSON array.")
-        return [_normalize_suggestion_row(item) for item in parsed]
+        return _parse_suggestion_rows(raw, "DeepSeek")
     except Exception as exc:
         st.error(f"DeepSeek request failed: {exc}")
         return None
+
+
+def _suggest_missing_links_with_claude(
+    doc_text: str,
+    missing_targets: list[dict],
+    api_key: str,
+) -> list[dict] | None:
+    system_prompt, user_prompt = _build_missing_links_prompt(doc_text, missing_targets)
+    model = _private_value("ANTHROPIC_MODEL") or CLAUDE_DEFAULT_MODEL
+
+    try:
+        response = requests.post(
+            "https://api.anthropic.com/v1/messages",
+            headers={
+                "x-api-key": api_key,
+                "anthropic-version": "2023-06-01",
+                "Content-Type": "application/json",
+            },
+            json={
+                "model": model,
+                "system": system_prompt,
+                "messages": [
+                    {"role": "user", "content": user_prompt},
+                ],
+                "temperature": 0.2,
+                "max_tokens": 3500,
+            },
+            timeout=90,
+        )
+        response.raise_for_status()
+        data = response.json()
+        raw = "".join(
+            block.get("text", "")
+            for block in data.get("content", [])
+            if block.get("type") == "text"
+        )
+        return _parse_suggestion_rows(raw, "Claude 4.6")
+    except Exception as exc:
+        st.error(f"Claude 4.6 request failed: {exc}")
+        return None
+
+
+def _parse_suggestion_rows(raw: str, provider: str) -> list[dict]:
+    raw = raw.strip()
+    raw = re.sub(r"^```(?:json)?\s*", "", raw)
+    raw = re.sub(r"\s*```$", "", raw)
+    parsed = json.loads(raw)
+    if not isinstance(parsed, list):
+        raise ValueError(f"{provider} did not return a JSON array.")
+    return [_normalize_suggestion_row(item) for item in parsed]
 
 
 def _normalize_suggestion_row(item: dict) -> dict:
