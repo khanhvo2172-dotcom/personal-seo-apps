@@ -533,7 +533,7 @@ def _copy_cells_table_html(df: pd.DataFrame, key: str) -> str:
             outline-offset: -2px;
         }}
     </style>
-    <div id="{table_id}">
+    <div id="{table_id}" tabindex="0">
         <div class="copy-toolbar">
             <button type="button" class="copy-selected">Copy selected cells</button>
             <button type="button" class="clear-selected">Clear</button>
@@ -556,8 +556,27 @@ def _copy_cells_table_html(df: pd.DataFrame, key: str) -> str:
             return cell.dataset.row + "," + cell.dataset.col;
         }}
 
+        async function copySelectedCells() {{
+            const values = Array.from(selected).map((key) => {{
+                const [row, col] = key.split(",").map(Number);
+                return data[row][col];
+            }});
+            if (!values.length) {{
+                status.textContent = "No cells selected.";
+                return;
+            }}
+
+            try {{
+                await navigator.clipboard.writeText(values.join("\\n"));
+                status.textContent = "Copied " + values.length + " cell(s).";
+            }} catch (error) {{
+                status.textContent = values.join("\\n");
+            }}
+        }}
+
         root.querySelectorAll("td").forEach((cell) => {{
             cell.addEventListener("click", (event) => {{
+                root.focus();
                 if (!event.ctrlKey && !event.metaKey) {{
                     selected.clear();
                     root.querySelectorAll("td.selected").forEach((el) => el.classList.remove("selected"));
@@ -581,21 +600,13 @@ def _copy_cells_table_html(df: pd.DataFrame, key: str) -> str:
             status.textContent = "No cells selected.";
         }});
 
-        root.querySelector(".copy-selected").addEventListener("click", async () => {{
-            const values = Array.from(selected).map((key) => {{
-                const [row, col] = key.split(",").map(Number);
-                return data[row][col];
-            }});
-            if (!values.length) {{
-                status.textContent = "No cells selected.";
-                return;
-            }}
+        root.querySelector(".copy-selected").addEventListener("click", copySelectedCells);
 
-            try {{
-                await navigator.clipboard.writeText(values.join("\\n"));
-                status.textContent = "Copied " + values.length + " cell(s).";
-            }} catch (error) {{
-                status.textContent = values.join("\\n");
+        root.addEventListener("keydown", (event) => {{
+            if ((event.ctrlKey || event.metaKey) && event.key.toLowerCase() === "c") {{
+                event.preventDefault();
+                event.stopPropagation();
+                copySelectedCells();
             }}
         }});
     </script>

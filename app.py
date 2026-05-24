@@ -1,4 +1,5 @@
 import streamlit as st
+import streamlit.components.v1 as components
 from dotenv import load_dotenv
 
 load_dotenv()
@@ -171,6 +172,35 @@ def _apply_style():
         </style>
         """,
         unsafe_allow_html=True,
+    )
+    components.html(
+        """
+        <script>
+        try {
+            const win = window.parent;
+            const doc = window.parent.document;
+            if (!doc.__personalToolsCopyGuard) {
+                doc.__personalToolsCopyGuard = true;
+                const blockStreamlitCopyShortcut = (event) => {
+                    const isCopyShortcut =
+                        (event.ctrlKey || event.metaKey) &&
+                        (event.key || "").toLowerCase() === "c";
+                    if (isCopyShortcut) {
+                        event.stopImmediatePropagation();
+                    }
+                };
+                ["keydown", "keypress", "keyup"].forEach((eventName) => {
+                    win.addEventListener(eventName, blockStreamlitCopyShortcut, true);
+                    doc.addEventListener(eventName, blockStreamlitCopyShortcut, true);
+                });
+            }
+        } catch (error) {
+            // No-op: browser copy still works if the parent document is unavailable.
+        }
+        </script>
+        """,
+        height=0,
+        width=0,
     )
 
 
