@@ -18,6 +18,10 @@ if "google_signed_out" not in st.session_state:
 if "selected_feature" not in st.session_state:
     st.session_state.selected_feature = "Settings"
 
+# When Google redirects back with ?code=, land on Settings so the callback is processed
+if "code" in st.query_params:
+    st.session_state.selected_feature = "Settings"
+
 from features import (
     autofill_column,
     check_links,

@@ -1,3 +1,4 @@
+import json
 import os
 import streamlit as st
 from pathlib import Path
@@ -12,7 +13,77 @@ def _save(key: str, value: str):
     os.environ[key] = value
 
 
+def _is_cloud() -> bool:
+    return bool(os.getenv("STREAMLIT_RUNTIME_ENV") or os.getenv("HOSTNAME"))
+
+
+def _get_private_value(key: str) -> str:
+    value = os.getenv(key, "").strip()
+    if value:
+        return value
+    try:
+        return str(st.secrets.get(key, "")).strip()
+    except Exception:
+        return ""
+
+
+def _get_client_config() -> dict | None:
+    """Load OAuth client config from GOOGLE_CLIENT_SECRET_JSON secret."""
+    raw = _get_private_value("GOOGLE_CLIENT_SECRET_JSON")
+    if not raw:
+        return None
+    try:
+        return json.loads(raw)
+    except Exception:
+        return None
+
+
+def _get_redirect_uri() -> str:
+    """Auto-detect the app's base URL for the OAuth redirect."""
+    try:
+        host = dict(st.context.headers).get("host", "localhost:8501")
+        proto = "https" if "." in host and not host.startswith("localhost") else "http"
+        return f"{proto}://{host}/"
+    except Exception:
+        return "http://localhost:8501/"
+
+
+def _handle_oauth_callback() -> bool:
+    """Exchange the ?code= from Google redirect for a token. Returns True if a callback was found."""
+    code = st.query_params.get("code")
+    if not code:
+        return False
+
+    from google_auth_oauthlib.flow import Flow
+    from features.auth import SCOPES, TOKEN_PATH
+
+    client_config = _get_client_config()
+    if not client_config:
+        st.error("Cannot complete sign-in: `GOOGLE_CLIENT_SECRET_JSON` not found in Secrets.")
+        st.query_params.clear()
+        return True
+
+    try:
+        flow = Flow.from_client_config(client_config, scopes=SCOPES, redirect_uri=_get_redirect_uri())
+        flow.fetch_token(code=code)
+        creds = flow.credentials
+        st.session_state.google_creds = creds
+        st.session_state.google_signed_out = False
+        st.session_state.oauth_new_token = creds.to_json()
+        try:
+            TOKEN_PATH.write_text(creds.to_json())
+        except Exception:
+            pass
+    except Exception as e:
+        st.session_state.oauth_error = str(e)
+
+    st.query_params.clear()
+    return True
+
+
 def render():
+    _handle_oauth_callback()
+
     st.header("Settings")
     load_dotenv(str(ENV_PATH), override=True)
     _render_quick_guide()
@@ -23,6 +94,22 @@ def render():
         "Required for: **Check Links in GDocs**, **Extract & Optimize Images**, "
         "and **Autofill Column** when using Google Sheets."
     )
+
+    # Show result from web OAuth callback
+    if st.session_state.get("oauth_error"):
+        st.error(f"Sign-in failed: {st.session_state.pop('oauth_error')}")
+
+    if st.session_state.get("oauth_new_token"):
+        st.success("✅ Authenticated successfully!")
+        st.info(
+            "**To persist after the app restarts**, copy the token below and paste it into "
+            "**Streamlit Cloud → App Settings → Secrets** as `GOOGLE_TOKEN_JSON`, then reboot the app:"
+        )
+        st.code(st.session_state.oauth_new_token, language="json")
+        if st.button("Dismiss", type="primary"):
+            del st.session_state.oauth_new_token
+            st.rerun()
+        st.divider()
 
     col_path, col_status = st.columns([3, 1])
     with col_path:
@@ -44,7 +131,7 @@ def render():
             _save("GOOGLE_CLIENT_SECRET_PATH", secret_path)
         st.caption(
             "On Streamlit Cloud, do not use a Windows file path here. "
-            "Add GOOGLE_TOKEN_JSON in App settings -> Secrets instead."
+            "Add GOOGLE_CLIENT_SECRET_JSON and GOOGLE_TOKEN_JSON in App settings → Secrets instead."
         )
 
     with col_status:
@@ -58,8 +145,12 @@ def render():
 
     col_auth, col_out = st.columns(2)
     with col_auth:
-        if st.button("🔐 Authenticate with Google", type="primary", use_container_width=True):
-            _run_oauth(secret_path)
+        if _is_cloud():
+            _render_web_auth_button()
+        else:
+            if st.button("🔐 Authenticate with Google", type="primary", use_container_width=True):
+                _run_oauth(secret_path)
+
     with col_out:
         if st.button("🚪 Sign Out", use_container_width=True):
             from features.auth import TOKEN_PATH
@@ -104,8 +195,48 @@ def render():
         _save("CLOUDINARY_API_SECRET", cld_secret)
         st.success("✅ Cloudinary settings saved.")
 
-    # Silently restore saved credentials on first load
     _auto_load_token()
+
+
+def _render_web_auth_button():
+    from google_auth_oauthlib.flow import Flow
+    from features.auth import SCOPES
+
+    client_config = _get_client_config()
+    if not client_config:
+        st.button("🔐 Authenticate with Google", type="primary", use_container_width=True, disabled=True)
+        st.caption(
+            "Add `GOOGLE_CLIENT_SECRET_JSON` to Streamlit Secrets to enable this. "
+            "See the guide below for setup steps."
+        )
+        with st.expander("Setup: enable web authentication"):
+            redirect_uri = _get_redirect_uri()
+            st.markdown(f"""
+**Step 1 — Register redirect URI in Google Cloud Console:**
+1. Go to [console.cloud.google.com](https://console.cloud.google.com) → **APIs & Services** → **Credentials**
+2. Click your OAuth 2.0 Client ID → **Edit**
+3. Under **Authorized redirect URIs**, add: `{redirect_uri}`
+4. Save
+
+**Step 2 — Add the client secret to Streamlit Secrets:**
+1. Open your `client_secret_....json` file and copy its contents
+2. Go to **Streamlit Cloud** → your app → **Settings** → **Secrets**
+3. Add:
+```toml
+GOOGLE_CLIENT_SECRET_JSON = '''<paste the JSON contents here>'''
+```
+4. Save and reboot the app
+            """.strip())
+        return
+
+    redirect_uri = _get_redirect_uri()
+    try:
+        flow = Flow.from_client_config(client_config, scopes=SCOPES, redirect_uri=redirect_uri)
+        auth_url, _ = flow.authorization_url(prompt="consent", access_type="offline")
+        st.link_button("🔐 Authenticate with Google", auth_url, type="primary", use_container_width=True)
+        st.caption(f"Redirect URI: `{redirect_uri}`")
+    except Exception as e:
+        st.error(f"Failed to build auth URL: {e}")
 
 
 def _render_quick_guide():
@@ -136,12 +267,6 @@ def _auto_load_token():
 
 
 def _run_oauth(secret_path: str):
-    if os.getenv("STREAMLIT_RUNTIME_ENV") or os.getenv("HOSTNAME"):
-        st.error(
-            "This button only works on your local computer. "
-            "For Streamlit Cloud, add GOOGLE_TOKEN_JSON in App settings -> Secrets."
-        )
-        return
     if not secret_path or not Path(secret_path).exists():
         st.error("Please provide a valid path to your OAuth Client Secret JSON file first.")
         return
