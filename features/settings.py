@@ -64,9 +64,9 @@ def render():
         if st.button("🚪 Sign Out", use_container_width=True):
             from features.auth import TOKEN_PATH
             st.session_state.google_creds = None
+            st.session_state.google_signed_out = True
             if TOKEN_PATH.exists():
                 TOKEN_PATH.unlink()
-            st.success("Signed out.")
             st.rerun()
 
     st.divider()
@@ -125,6 +125,8 @@ After changing Google permissions, sign out and authenticate again so Google gra
 
 
 def _auto_load_token():
+    if st.session_state.get("google_signed_out"):
+        return
     if st.session_state.get("google_creds") is not None:
         return
     from features.auth import load_credentials
@@ -152,6 +154,7 @@ def _run_oauth(secret_path: str):
         creds = flow.run_local_server(port=0)
         TOKEN_PATH.write_text(creds.to_json())
         st.session_state.google_creds = creds
+        st.session_state.google_signed_out = False
         st.success("✅ Authenticated successfully!")
         st.rerun()
     except Exception as e:

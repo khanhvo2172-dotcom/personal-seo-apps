@@ -13,6 +13,8 @@ st.set_page_config(
 
 if "google_creds" not in st.session_state:
     st.session_state.google_creds = None
+if "google_signed_out" not in st.session_state:
+    st.session_state.google_signed_out = False
 if "selected_feature" not in st.session_state:
     st.session_state.selected_feature = "Settings"
 
