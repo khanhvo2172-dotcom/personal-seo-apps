@@ -23,6 +23,7 @@ from features import (
     extract_optimize_images,
     humanizer,
     keyword_grouping,
+    remove_empty_rows,
     settings,
 )
 
@@ -34,6 +35,7 @@ FEATURES = {
     "Download Images using GDrive Links": download_gdrive_images.render,
     "Keyword Grouping": keyword_grouping.render,
     "Autofill Column": autofill_column.render,
+    "Remove Empty Rows in Google Docs": remove_empty_rows.render,
 }
 
 

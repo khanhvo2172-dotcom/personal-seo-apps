@@ -11,7 +11,8 @@ BASE_SCOPES = [
     "https://www.googleapis.com/auth/drive.readonly",
 ]
 SHEETS_SCOPE = "https://www.googleapis.com/auth/spreadsheets"
-SCOPES = BASE_SCOPES + [SHEETS_SCOPE]
+DOCS_WRITE_SCOPE = "https://www.googleapis.com/auth/documents"
+SCOPES = BASE_SCOPES + [SHEETS_SCOPE, DOCS_WRITE_SCOPE]
 
 TOKEN_PATH = Path("token.json")
 
