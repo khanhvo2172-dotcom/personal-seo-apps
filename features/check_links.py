@@ -1,11 +1,9 @@
 import json
 import os
 import re
-import html
 import pandas as pd
 import requests
 import streamlit as st
-import streamlit.components.v1 as components
 from collections import Counter
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from urllib.parse import urlsplit, urlunsplit, unquote
@@ -92,24 +90,32 @@ def _normalize(url: str) -> str:
 
 
 def _find_links(elements: list, found: list):
-    """Recursively extract (url, anchor_text) pairs from document elements."""
+    """Recursively extract (url, anchor_text) pairs from document elements.
+
+    Adjacent same-URL textRuns within a single paragraph are merged (they
+    represent one hyperlink whose anchor text was split by formatting).
+    Links in *different* paragraphs are kept separate so duplicate
+    detection works correctly.
+    """
     for el in elements:
         if "paragraph" in el:
+            para_links: list[tuple[str, str]] = []
             for pe in el["paragraph"].get("elements", []):
                 if "textRun" in pe:
                     tr = pe["textRun"]
                     link = tr.get("textStyle", {}).get("link")
                     if link and link.get("url"):
                         anchor = tr.get("content", "").replace("\n", " ").strip()
-                        found.append((link["url"], anchor))
+                        para_links.append((link["url"], anchor))
                 if "inlineObjectElement" in pe:
                     link = pe["inlineObjectElement"].get("textStyle", {}).get("link")
                     if link and link.get("url"):
-                        found.append((link["url"], "embedded in image"))
+                        para_links.append((link["url"], "embedded in image"))
                 if "richLink" in pe:
                     props = pe["richLink"].get("richLinkProperties", {}) or {}
                     if props.get("uri"):
-                        found.append((props["uri"], (props.get("title") or "").strip()))
+                        para_links.append((props["uri"], (props.get("title") or "").strip()))
+            found.extend(_merge_adjacent(para_links))
         elif "table" in el:
             for row in el["table"].get("tableRows", []):
                 for cell in row.get("tableCells", []):
@@ -233,8 +239,7 @@ def _run_check(doc_url: str, urls_input: str):
         for item in doc.get(part, {}).values():
             _find_links(item.get("content", []), raw)
 
-    merged = _merge_adjacent(raw)
-    normalized = [(n, a) for u, a in merged if (n := _normalize(u))]
+    normalized = [(n, a) for u, a in raw if (n := _normalize(u))]
     unique = list(dict.fromkeys(normalized))
 
     target_url_titles = _parse_target_urls(urls_input)
@@ -279,6 +284,7 @@ def _render_results(results: dict):
     st.subheader("✅ All Links Found in Document")
     pd.set_option("display.max_colwidth", None)
     df_found = pd.DataFrame(unique, columns=["🔗 Link", "💬 Anchor Text", "Status Code"])
+    df_found.insert(0, "#", range(1, len(df_found) + 1))
     df_found = _filter_dataframe(
         df_found,
         _render_filter(
@@ -435,12 +441,6 @@ def _render_selectable_table(df: pd.DataFrame, key: str, label: str):
         on_select="rerun",
         selection_mode="multi-row",
     )
-    with st.expander(f"Copy cells from {label}"):
-        components.html(
-            _copy_cells_table_html(df, key),
-            height=_copy_cells_table_height(df),
-            scrolling=True,
-        )
 
 
 def _filter_dataframe(df: pd.DataFrame, query: str) -> pd.DataFrame:
@@ -455,162 +455,6 @@ def _filter_dataframe(df: pd.DataFrame, query: str) -> pd.DataFrame:
     return df[matches]
 
 
-def _copy_cells_table_height(df: pd.DataFrame) -> int:
-    return min(520, max(220, 125 + (min(len(df), 10) * 36)))
-
-
-def _copy_cells_table_html(df: pd.DataFrame, key: str) -> str:
-    columns = [str(col) for col in df.columns]
-    rows = df.astype(str).values.tolist()
-    table_id = f"copy-cells-{key}"
-    rows_json = json.dumps(rows)
-
-    header_html = "".join(f"<th>{html.escape(col)}</th>" for col in columns)
-    body_html = []
-    for row_index, row in enumerate(rows):
-        cells = []
-        for col_index, value in enumerate(row):
-            cells.append(
-                f'<td data-row="{row_index}" data-col="{col_index}">{html.escape(value)}</td>'
-            )
-        body_html.append(f"<tr>{''.join(cells)}</tr>")
-
-    return f"""
-    <style>
-        #{table_id} {{
-            font-family: Arial, sans-serif;
-            color: #111827;
-        }}
-        #{table_id} .copy-toolbar {{
-            display: flex;
-            align-items: center;
-            gap: 8px;
-            margin-bottom: 8px;
-        }}
-        #{table_id} button {{
-            border: 1px solid #d1d5db;
-            border-radius: 6px;
-            background: #ffffff;
-            color: #111827;
-            padding: 6px 10px;
-            cursor: pointer;
-        }}
-        #{table_id} .copy-status {{
-            font-size: 12px;
-            color: #4b5563;
-        }}
-        #{table_id} .copy-table-wrap {{
-            max-height: 390px;
-            overflow: auto;
-            border: 1px solid #e5e7eb;
-            border-radius: 8px;
-        }}
-        #{table_id} table {{
-            width: 100%;
-            border-collapse: collapse;
-            table-layout: fixed;
-            font-size: 13px;
-        }}
-        #{table_id} th,
-        #{table_id} td {{
-            border-bottom: 1px solid #e5e7eb;
-            border-right: 1px solid #e5e7eb;
-            padding: 8px;
-            text-align: left;
-            vertical-align: top;
-            overflow-wrap: anywhere;
-            user-select: none;
-        }}
-        #{table_id} th {{
-            position: sticky;
-            top: 0;
-            background: #f9fafb;
-            z-index: 1;
-        }}
-        #{table_id} td.selected {{
-            background: #dbeafe;
-            outline: 2px solid #2563eb;
-            outline-offset: -2px;
-        }}
-    </style>
-    <div id="{table_id}" tabindex="0">
-        <div class="copy-toolbar">
-            <button type="button" class="copy-selected">Copy selected cells</button>
-            <button type="button" class="clear-selected">Clear</button>
-            <span class="copy-status">No cells selected.</span>
-        </div>
-        <div class="copy-table-wrap">
-            <table>
-                <thead><tr>{header_html}</tr></thead>
-                <tbody>{''.join(body_html)}</tbody>
-            </table>
-        </div>
-    </div>
-    <script>
-        const root = document.getElementById({json.dumps(table_id)});
-        const data = {rows_json};
-        const selected = new Set();
-        const status = root.querySelector(".copy-status");
-
-        function selectionKey(cell) {{
-            return cell.dataset.row + "," + cell.dataset.col;
-        }}
-
-        async function copySelectedCells() {{
-            const values = Array.from(selected).map((key) => {{
-                const [row, col] = key.split(",").map(Number);
-                return data[row][col];
-            }});
-            if (!values.length) {{
-                status.textContent = "No cells selected.";
-                return;
-            }}
-
-            try {{
-                await navigator.clipboard.writeText(values.join("\\n"));
-                status.textContent = "Copied " + values.length + " cell(s).";
-            }} catch (error) {{
-                status.textContent = values.join("\\n");
-            }}
-        }}
-
-        root.querySelectorAll("td").forEach((cell) => {{
-            cell.addEventListener("click", (event) => {{
-                root.focus();
-                if (!event.ctrlKey && !event.metaKey) {{
-                    selected.clear();
-                    root.querySelectorAll("td.selected").forEach((el) => el.classList.remove("selected"));
-                }}
-
-                const key = selectionKey(cell);
-                if (selected.has(key)) {{
-                    selected.delete(key);
-                    cell.classList.remove("selected");
-                }} else {{
-                    selected.add(key);
-                    cell.classList.add("selected");
-                }}
-                status.textContent = selected.size + " cell(s) selected.";
-            }});
-        }});
-
-        root.querySelector(".clear-selected").addEventListener("click", () => {{
-            selected.clear();
-            root.querySelectorAll("td.selected").forEach((el) => el.classList.remove("selected"));
-            status.textContent = "No cells selected.";
-        }});
-
-        root.querySelector(".copy-selected").addEventListener("click", copySelectedCells);
-
-        root.addEventListener("keydown", (event) => {{
-            if ((event.ctrlKey || event.metaKey) && event.key.toLowerCase() === "c") {{
-                event.preventDefault();
-                event.stopPropagation();
-                copySelectedCells();
-            }}
-        }});
-    </script>
-    """
 
 
 def _check_status_codes(urls: list[str]) -> dict[str, str]:
