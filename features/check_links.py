@@ -298,6 +298,7 @@ def _render_results(results: dict):
         df_found,
         "check_links_table_found",
         "All links",
+        copy_column="🔗 Link",
     )
 
     col1, col2 = st.columns(2)
@@ -318,6 +319,7 @@ def _render_results(results: dict):
                 df_missing,
                 "check_links_table_missing",
                 "Missing links",
+                copy_column="URL",
             )
         else:
             st.success("All target URLs are present in the document.")
@@ -433,14 +435,35 @@ def _with_status(rows: list, table_type: str) -> list:
     return normalized
 
 
-def _render_selectable_table(df: pd.DataFrame, key: str, label: str):
-    _render_copy_button(df, key)
-    st.dataframe(
-        df,
-        use_container_width=True,
-        hide_index=True,
-        key=key,
-    )
+def _render_selectable_table(
+    df: pd.DataFrame, key: str, label: str, copy_column: str | None = None
+):
+    if copy_column and copy_column in df.columns:
+        event = st.dataframe(
+            df,
+            use_container_width=True,
+            hide_index=True,
+            key=key,
+            on_select="rerun",
+            selection_mode="multi-row",
+        )
+        selected_rows = (
+            event.selection.rows
+            if event and hasattr(event, "selection") and event.selection
+            else []
+        )
+        if selected_rows:
+            links = df.iloc[selected_rows][copy_column].tolist()
+            links_text = "\n".join(str(l) for l in links)
+            _render_copy_selected_button(links_text, key, len(links))
+    else:
+        _render_copy_button(df, key)
+        st.dataframe(
+            df,
+            use_container_width=True,
+            hide_index=True,
+            key=key,
+        )
 
 
 def _render_copy_button(df: pd.DataFrame, key: str):
@@ -469,6 +492,41 @@ def _render_copy_button(df: pd.DataFrame, key: str):
                     await navigator.clipboard.writeText(data);
                     this.querySelector("span").textContent = "Copied!";
                     setTimeout(() => this.querySelector("span").textContent = "Copy table", 1500);
+                }} catch(e) {{
+                    this.querySelector("span").textContent = "Failed";
+                }}
+            }});
+        </script>
+        """,
+        height=38,
+    )
+
+
+def _render_copy_selected_button(links_text: str, key: str, count: int):
+    escaped = json.dumps(links_text)
+    btn_id = f"copy-sel-{key}"
+    components.html(
+        f"""
+        <button id="{btn_id}" style="
+            border: 1px solid #2563eb; border-radius: 6px; background: #eff6ff;
+            color: #1d4ed8; padding: 5px 12px; cursor: pointer; font-size: 13px;
+            display: inline-flex; align-items: center; gap: 5px;
+        ">
+            <svg width="14" height="14" viewBox="0 0 24 24" fill="none"
+                 stroke="currentColor" stroke-width="2" stroke-linecap="round"
+                 stroke-linejoin="round">
+                <rect x="9" y="9" width="13" height="13" rx="2"/>
+                <path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"/>
+            </svg>
+            <span>Copy {count} selected link{"s" if count != 1 else ""}</span>
+        </button>
+        <script>
+            document.getElementById({json.dumps(btn_id)}).addEventListener("click", async function() {{
+                const data = {escaped};
+                try {{
+                    await navigator.clipboard.writeText(data);
+                    this.querySelector("span").textContent = "Copied!";
+                    setTimeout(() => this.querySelector("span").textContent = "Copy {count} selected link{"s" if count != 1 else ""}", 1500);
                 }} catch(e) {{
                     this.querySelector("span").textContent = "Failed";
                 }}
