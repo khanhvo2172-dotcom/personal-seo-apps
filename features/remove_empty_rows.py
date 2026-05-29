@@ -105,14 +105,35 @@ def _is_empty_paragraph(element: dict) -> bool:
 
 def _collect_empty_ranges(content: list) -> list[dict]:
     ranges = []
-    # Skip the last structural element (document end marker)
-    items = content[:-1] if len(content) > 1 else []
-    for element in items:
+
+    # Identify indices of elements that are paragraphs
+    para_indices = [i for i, el in enumerate(content) if "paragraph" in el]
+    if len(para_indices) <= 1:
+        # Must keep at least one paragraph in the body
+        return []
+
+    # Protect the last paragraph so the body always has ≥1 paragraph
+    protected: set[int] = {para_indices[-1]}
+
+    # Protect paragraphs immediately before a non-paragraph structural element
+    # (table, sectionBreak, tableOfContents) — Google Docs requires a paragraph
+    # boundary before these elements.
+    for i, el in enumerate(content):
+        is_structural = any(
+            k in el for k in ("table", "sectionBreak", "tableOfContents")
+        )
+        if is_structural and i > 0 and "paragraph" in content[i - 1]:
+            protected.add(i - 1)
+
+    for i, element in enumerate(content):
+        if i in protected:
+            continue
         if _is_empty_paragraph(element):
             start = element.get("startIndex")
             end = element.get("endIndex")
             if start is not None and end is not None:
                 ranges.append({"startIndex": start, "endIndex": end})
+
     # Delete from bottom to top so earlier indices aren't shifted
     ranges.sort(key=lambda r: r["startIndex"], reverse=True)
     return ranges
