@@ -7,7 +7,7 @@ from features.auth import get_credentials, require_auth
 
 def render():
     st.header("Remove Empty Rows in Google Docs")
-    st.caption("Removes all completely empty paragraphs from one or more Google Docs files.")
+    st.caption("Removes empty paragraphs and optionally trims trailing spaces from one or more Google Docs files.")
     _render_guide()
 
     if not require_auth():
@@ -27,6 +27,11 @@ def render():
             ["Tab from URL (or first tab if none specified)", "All tabs"],
             horizontal=True,
         )
+        trim_spaces = st.checkbox(
+            "Also trim trailing spaces from paragraphs",
+            value=True,
+            help="Removes invisible spaces/tabs at the end of each paragraph (before the line break).",
+        )
         submitted = st.form_submit_button("🗑️ Remove Empty Rows", type="primary")
 
     if not submitted:
@@ -38,7 +43,7 @@ def render():
         return
 
     creds = get_credentials()
-    _run(urls, tab_mode, creds)
+    _run(urls, tab_mode, trim_spaces, creds)
 
 
 def _render_guide():
@@ -50,6 +55,7 @@ def _render_guide():
 4. Click **Remove Empty Rows**.
 
 Only completely empty paragraphs (no text, no images, no special elements) are removed.
+Optionally, trailing spaces at the end of each paragraph are also trimmed.
 If a tab URL is provided, only that tab is processed. Otherwise the first tab is used.
         """.strip())
 
@@ -139,7 +145,41 @@ def _collect_empty_ranges(content: list) -> list[dict]:
     return ranges
 
 
-def _delete_in_tab(docs_service, doc_id: str, tab_id: str | None, ranges: list[dict]) -> int:
+def _collect_trailing_space_ranges(content: list) -> list[dict]:
+    """Find trailing whitespace (spaces/tabs before the newline) in paragraph text runs."""
+    ranges = []
+    for element in content:
+        para = element.get("paragraph")
+        if not para:
+            continue
+        elements = para.get("elements") or []
+        if not elements:
+            continue
+        # Check the last text run in the paragraph
+        last_el = elements[-1]
+        tr = last_el.get("textRun")
+        if not tr:
+            continue
+        text = tr.get("content", "")
+        if not text.endswith("\n"):
+            continue
+        before_newline = text[:-1]
+        stripped = before_newline.rstrip(" \t")
+        trailing_len = len(before_newline) - len(stripped)
+        if trailing_len > 0:
+            end_idx = last_el.get("endIndex")
+            if end_idx is not None:
+                # Trailing spaces sit right before the \n character
+                space_start = end_idx - 1 - trailing_len
+                space_end = end_idx - 1
+                ranges.append({"startIndex": space_start, "endIndex": space_end})
+    ranges.sort(key=lambda r: r["startIndex"], reverse=True)
+    return ranges
+
+
+def _delete_ranges_in_tab(
+    docs_service, doc_id: str, tab_id: str | None, ranges: list[dict]
+) -> int:
     if not ranges:
         return 0
     requests_body = []
@@ -154,7 +194,7 @@ def _delete_in_tab(docs_service, doc_id: str, tab_id: str | None, ranges: list[d
     return len(requests_body)
 
 
-def _process_doc(docs_service, url: str, tab_mode: str) -> dict:
+def _process_doc(docs_service, url: str, tab_mode: str, trim_spaces: bool) -> dict:
     doc_id = _extract_doc_id(url)
     doc = docs_service.documents().get(
         documentId=doc_id, includeTabsContent=True
@@ -163,7 +203,7 @@ def _process_doc(docs_service, url: str, tab_mode: str) -> dict:
     all_tabs = _flatten_tabs(doc)
 
     if not all_tabs:
-        return {"title": title, "url": url, "removed": 0, "error": "No tabs found"}
+        return {"title": title, "url": url, "removed": 0, "trimmed": 0, "error": "No tabs found"}
 
     if "All tabs" in tab_mode:
         chosen = all_tabs
@@ -175,18 +215,32 @@ def _process_doc(docs_service, url: str, tab_mode: str) -> dict:
             chosen = [all_tabs[0]]
 
     total_removed = 0
+    total_trimmed = 0
     for tab in chosen:
         tid = _tab_id(tab) or None
         doc_tab = tab.get("documentTab", {}) or {}
         body_content = (doc_tab.get("body", {}) or {}).get("content") or []
-        ranges = _collect_empty_ranges(body_content)
-        removed = _delete_in_tab(docs_service, doc_id, tid, ranges)
-        total_removed += removed
 
-    return {"title": title, "url": url, "removed": total_removed, "error": None}
+        # Collect all deletion ranges — empty rows + trailing spaces
+        empty_ranges = _collect_empty_ranges(body_content)
+        space_ranges = _collect_trailing_space_ranges(body_content) if trim_spaces else []
+
+        # Merge into one sorted list (both already reverse-sorted)
+        # Ranges don't overlap (empty vs non-empty paragraphs), so merge + re-sort
+        all_ranges = sorted(
+            empty_ranges + space_ranges,
+            key=lambda r: r["startIndex"],
+            reverse=True,
+        )
+
+        deleted = _delete_ranges_in_tab(docs_service, doc_id, tid, all_ranges)
+        total_removed += len(empty_ranges)
+        total_trimmed += len(space_ranges)
+
+    return {"title": title, "url": url, "removed": total_removed, "trimmed": total_trimmed, "error": None}
 
 
-def _run(urls: list[str], tab_mode: str, creds):
+def _run(urls: list[str], tab_mode: str, trim_spaces: bool, creds):
     from googleapiclient.discovery import build
     from googleapiclient.errors import HttpError
 
@@ -204,7 +258,7 @@ def _run(urls: list[str], tab_mode: str, creds):
         progress.progress(i / len(urls), text=f"Processing {i + 1}/{len(urls)}…")
         status.caption(url)
         try:
-            result = _process_doc(docs_service, url, tab_mode)
+            result = _process_doc(docs_service, url, tab_mode, trim_spaces)
         except HttpError as e:
             if e.resp.status == 403:
                 error_msg = (
@@ -214,29 +268,41 @@ def _run(urls: list[str], tab_mode: str, creds):
             else:
                 error_msg = str(e)
             fallback = url.split("/d/")[1].split("/")[0] if "/d/" in url else url
-            result = {"title": fallback, "url": url, "removed": 0, "error": error_msg}
+            result = {"title": fallback, "url": url, "removed": 0, "trimmed": 0, "error": error_msg}
         except Exception as e:
             fallback = url.split("/d/")[1].split("/")[0] if "/d/" in url else url
-            result = {"title": fallback, "url": url, "removed": 0, "error": str(e)}
+            result = {"title": fallback, "url": url, "removed": 0, "trimmed": 0, "error": str(e)}
         results.append(result)
 
     progress.progress(1.0, text="Done!")
     status.empty()
 
     total_removed = sum(r["removed"] for r in results)
+    total_trimmed = sum(r.get("trimmed", 0) for r in results)
     errors = [r for r in results if r["error"]]
 
-    if errors:
-        st.warning(f"Completed with {len(errors)} error(s). {total_removed} empty row(s) removed in total.")
-    else:
-        st.success(f"✅ Done! Removed {total_removed} empty row(s) across {len(results)} document(s).")
+    parts = []
+    if total_removed:
+        parts.append(f"{total_removed} empty row(s) removed")
+    if total_trimmed:
+        parts.append(f"{total_trimmed} paragraph(s) trimmed")
+    summary = ", ".join(parts) if parts else "No changes needed"
 
-    df = pd.DataFrame([
-        {
+    if errors:
+        st.warning(f"Completed with {len(errors)} error(s). {summary}.")
+    else:
+        st.success(f"✅ Done! {summary} across {len(results)} document(s).")
+
+    rows = []
+    for r in results:
+        row = {
             "Document": r["title"],
             "Empty Rows Removed": r["removed"],
-            "Status": f"❌ {r['error']}" if r["error"] else "✅ Success",
         }
-        for r in results
-    ])
+        if trim_spaces:
+            row["Trailing Spaces Trimmed"] = r.get("trimmed", 0)
+        row["Status"] = f"❌ {r['error']}" if r["error"] else "✅ Success"
+        rows.append(row)
+
+    df = pd.DataFrame(rows)
     st.dataframe(df, use_container_width=True, hide_index=True)
