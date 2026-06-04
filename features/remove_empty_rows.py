@@ -123,13 +123,24 @@ def _collect_empty_ranges(content: list) -> list[dict]:
 
     # Protect paragraphs immediately before a non-paragraph structural element
     # (table, sectionBreak, tableOfContents) — Google Docs requires a paragraph
-    # boundary before these elements.
+    # boundary before these elements.  Only protect the adjacent paragraph when
+    # no other non-empty paragraph sits between the previous structural element
+    # (or start of document) and this one; if a non-empty paragraph exists it
+    # will remain after cleanup and satisfy the boundary requirement.
     for i, el in enumerate(content):
         is_structural = any(
             k in el for k in ("table", "sectionBreak", "tableOfContents")
         )
         if is_structural and i > 0 and "paragraph" in content[i - 1]:
-            protected.add(i - 1)
+            has_other_para = False
+            for j in range(i - 2, -1, -1):
+                if any(k in content[j] for k in ("table", "sectionBreak", "tableOfContents")):
+                    break
+                if "paragraph" in content[j] and not _is_empty_paragraph(content[j]):
+                    has_other_para = True
+                    break
+            if not has_other_para:
+                protected.add(i - 1)
 
     for i, element in enumerate(content):
         if i in protected:
