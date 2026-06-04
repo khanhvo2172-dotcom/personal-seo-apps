@@ -112,21 +112,13 @@ def _is_empty_paragraph(element: dict) -> bool:
 def _collect_empty_ranges(content: list) -> list[dict]:
     ranges = []
 
-    # Identify indices of elements that are paragraphs
     para_indices = [i for i, el in enumerate(content) if "paragraph" in el]
     if len(para_indices) <= 1:
-        # Must keep at least one paragraph in the body
         return []
 
-    # Protect the last paragraph so the body always has ≥1 paragraph
     protected: set[int] = {para_indices[-1]}
+    merge_into_prev: set[int] = set()
 
-    # Protect paragraphs immediately before a non-paragraph structural element
-    # (table, sectionBreak, tableOfContents) — Google Docs requires a paragraph
-    # boundary before these elements.  Only protect the adjacent paragraph when
-    # no other non-empty paragraph sits between the previous structural element
-    # (or start of document) and this one; if a non-empty paragraph exists it
-    # will remain after cleanup and satisfy the boundary requirement.
     for i, el in enumerate(content):
         is_structural = any(
             k in el for k in ("table", "sectionBreak", "tableOfContents")
@@ -139,11 +131,16 @@ def _collect_empty_ranges(content: list) -> list[dict]:
                 if "paragraph" in content[j] and not _is_empty_paragraph(content[j]):
                     has_other_para = True
                     break
-            if not has_other_para:
-                protected.add(i - 1)
+            if has_other_para:
+                merge_into_prev.add(i - 1)
+            protected.add(i - 1)
 
     for i, element in enumerate(content):
         if i in protected:
+            if i in merge_into_prev and _is_empty_paragraph(element):
+                start = element.get("startIndex")
+                if start is not None and start > 1:
+                    ranges.append({"startIndex": start - 1, "endIndex": start})
             continue
         if _is_empty_paragraph(element):
             start = element.get("startIndex")
@@ -151,9 +148,16 @@ def _collect_empty_ranges(content: list) -> list[dict]:
             if start is not None and end is not None:
                 ranges.append({"startIndex": start, "endIndex": end})
 
-    # Delete from bottom to top so earlier indices aren't shifted
-    ranges.sort(key=lambda r: r["startIndex"], reverse=True)
-    return ranges
+    seen: set[tuple[int, int]] = set()
+    unique = []
+    for r in ranges:
+        key = (r["startIndex"], r["endIndex"])
+        if key not in seen:
+            seen.add(key)
+            unique.append(r)
+
+    unique.sort(key=lambda r: r["startIndex"], reverse=True)
+    return unique
 
 
 def _collect_trailing_space_ranges(content: list) -> list[dict]:
