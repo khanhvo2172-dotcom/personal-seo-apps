@@ -242,7 +242,7 @@ def render():
 
 
 def _render_web_auth_button():
-    from google_auth_oauthlib.flow import Flow
+    from urllib.parse import urlencode
     from features.auth import SCOPES
 
     client_config = _get_client_config()
@@ -272,14 +272,21 @@ GOOGLE_CLIENT_SECRET_JSON = '''<paste the JSON contents here>'''
             """.strip())
         return
 
-    redirect_uri = _get_redirect_uri()
+    web_cfg = client_config.get("web", {})
+    redirect_uri = _get_redirect_uri(client_config)
     try:
-        flow = Flow.from_client_config(client_config, scopes=SCOPES, redirect_uri=redirect_uri)
-        # Disable PKCE — not needed for web apps with a client_secret, and the
-        # code_verifier cannot survive the full-page redirect in Streamlit.
-        if hasattr(flow.oauth2session, "_pkce"):
-            flow.oauth2session._pkce = None
-        auth_url, _ = flow.authorization_url(prompt="consent", access_type="offline")
+        # Build the auth URL manually to avoid PKCE issues from newer
+        # google-auth-oauthlib / requests-oauthlib versions.  PKCE is not
+        # required for confidential (web) clients that have a client_secret.
+        params = {
+            "client_id": web_cfg["client_id"],
+            "redirect_uri": redirect_uri,
+            "response_type": "code",
+            "scope": " ".join(SCOPES),
+            "access_type": "offline",
+            "prompt": "consent",
+        }
+        auth_url = f"{web_cfg['auth_uri']}?{urlencode(params)}"
         st.link_button("🔐 Authenticate with Google", auth_url, type="primary", use_container_width=True)
         st.caption(f"Redirect URI: `{redirect_uri}`")
     except Exception as e:
