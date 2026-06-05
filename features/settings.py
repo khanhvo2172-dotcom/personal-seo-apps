@@ -38,8 +38,29 @@ def _get_client_config() -> dict | None:
         return None
 
 
-def _get_redirect_uri() -> str:
-    """Auto-detect the app's base URL for the OAuth redirect."""
+def _get_redirect_uri_from_config(client_config: dict | None = None) -> str | None:
+    """Extract the first redirect_uri from the OAuth client config JSON."""
+    if not client_config:
+        client_config = _get_client_config()
+    if not client_config:
+        return None
+    for key in ("web", "installed"):
+        if key in client_config:
+            uris = client_config[key].get("redirect_uris", [])
+            if uris:
+                return uris[0]
+    return None
+
+
+def _get_redirect_uri(client_config: dict | None = None) -> str:
+    """Return the OAuth redirect URI.
+
+    Prefers the URI from the client secret JSON (guaranteed to match Google
+    Cloud Console).  Falls back to auto-detection from request headers.
+    """
+    from_config = _get_redirect_uri_from_config(client_config)
+    if from_config:
+        return from_config
     try:
         host = dict(st.context.headers).get("host", "localhost:8501")
         proto = "https" if "." in host and not host.startswith("localhost") else "http"
