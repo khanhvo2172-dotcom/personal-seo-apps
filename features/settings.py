@@ -85,7 +85,9 @@ def _handle_oauth_callback() -> bool:
         return True
 
     try:
-        flow = Flow.from_client_config(client_config, scopes=SCOPES, redirect_uri=_get_redirect_uri())
+        flow = Flow.from_client_config(client_config, scopes=SCOPES, redirect_uri=_get_redirect_uri(client_config))
+        if hasattr(flow.oauth2session, "_pkce"):
+            flow.oauth2session._pkce = None
         flow.fetch_token(code=code)
         creds = flow.credentials
         st.session_state.google_creds = creds
@@ -253,6 +255,10 @@ GOOGLE_CLIENT_SECRET_JSON = '''<paste the JSON contents here>'''
     redirect_uri = _get_redirect_uri()
     try:
         flow = Flow.from_client_config(client_config, scopes=SCOPES, redirect_uri=redirect_uri)
+        # Disable PKCE — not needed for web apps with a client_secret, and the
+        # code_verifier cannot survive the full-page redirect in Streamlit.
+        if hasattr(flow.oauth2session, "_pkce"):
+            flow.oauth2session._pkce = None
         auth_url, _ = flow.authorization_url(prompt="consent", access_type="offline")
         st.link_button("🔐 Authenticate with Google", auth_url, type="primary", use_container_width=True)
         st.caption(f"Redirect URI: `{redirect_uri}`")
