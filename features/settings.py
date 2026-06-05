@@ -75,7 +75,8 @@ def _handle_oauth_callback() -> bool:
     if not code:
         return False
 
-    from google_auth_oauthlib.flow import Flow
+    import requests as _req
+    from google.oauth2.credentials import Credentials
     from features.auth import SCOPES, TOKEN_PATH
 
     client_config = _get_client_config()
@@ -85,11 +86,30 @@ def _handle_oauth_callback() -> bool:
         return True
 
     try:
-        flow = Flow.from_client_config(client_config, scopes=SCOPES, redirect_uri=_get_redirect_uri(client_config))
-        if hasattr(flow.oauth2session, "_pkce"):
-            flow.oauth2session._pkce = None
-        flow.fetch_token(code=code)
-        creds = flow.credentials
+        web_cfg = client_config["web"]
+        redirect_uri = _get_redirect_uri(client_config)
+
+        # Exchange authorization code for tokens directly (no PKCE dependency)
+        token_resp = _req.post(web_cfg["token_uri"], data={
+            "code": code,
+            "client_id": web_cfg["client_id"],
+            "client_secret": web_cfg["client_secret"],
+            "redirect_uri": redirect_uri,
+            "grant_type": "authorization_code",
+        })
+        token_data = token_resp.json()
+
+        if "error" in token_data:
+            raise ValueError(f"({token_data['error']}) {token_data.get('error_description', '')}")
+
+        creds = Credentials(
+            token=token_data["access_token"],
+            refresh_token=token_data.get("refresh_token"),
+            token_uri=web_cfg["token_uri"],
+            client_id=web_cfg["client_id"],
+            client_secret=web_cfg["client_secret"],
+            scopes=SCOPES,
+        )
         st.session_state.google_creds = creds
         st.session_state.google_signed_out = False
         st.session_state.oauth_new_token = creds.to_json()
