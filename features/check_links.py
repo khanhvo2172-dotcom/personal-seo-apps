@@ -475,22 +475,23 @@ def _render_results(results: dict):
             st.success("No duplicate links found.")
 
     if results.get("check_ml"):
-        st.subheader("🌐 Multilingual Links Found in Document")
-        ml_links = results.get("multilingual_links") or []
-        if ml_links:
-            df_ml = pd.DataFrame(ml_links)
-            _render_selectable_table(df_ml, "check_links_table_ml", "Multilingual links", copy_column="URL")
-        else:
-            st.info("No multilingual links (ES/DE/FR) found for the provided pages.")
-
-    if results.get("check_ml"):
-        st.subheader("⚠️ Still-English Links (multilingual version available)")
-        eng_links = results.get("english_ml_links") or []
-        if eng_links:
-            df_eng = pd.DataFrame(eng_links)
-            _render_selectable_table(df_eng, "check_links_table_eng_ml", "Still-English links", copy_column="URL")
-        else:
-            st.success("No English-version links found for pages that have multilingual versions.")
+        ml_col, eng_col = st.columns(2)
+        with ml_col:
+            st.subheader("🌐 Multilingual Links Found in Document")
+            ml_links = results.get("multilingual_links") or []
+            if ml_links:
+                df_ml = pd.DataFrame(ml_links)
+                _render_selectable_table(df_ml, "check_links_table_ml", "Multilingual links", copy_column="URL")
+            else:
+                st.info("No multilingual links (ES/DE/FR) found for the provided pages.")
+        with eng_col:
+            st.subheader("⚠️ Still-English Links (multilingual version available)")
+            eng_links = results.get("english_ml_links") or []
+            if eng_links:
+                df_eng = pd.DataFrame(eng_links)
+                _render_selectable_table(df_eng, "check_links_table_eng_ml", "Still-English links", copy_column="URL")
+            else:
+                st.success("No English-version links found for pages that have multilingual versions.")
 
     missing_targets = results.get("deepseek_missing_targets") or []
     if missing_targets:
