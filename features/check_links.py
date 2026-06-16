@@ -14,6 +14,12 @@ STATUS_CHECK_TIMEOUT = 8
 STATUS_CHECK_WORKERS = 10
 CLAUDE_DEFAULT_MODEL = "claude-sonnet-4-20250514"
 
+RE_ML_LINK = re.compile(
+    r"https?://(?:www\.)?trueprofit\.io/(es|de|fr)/blog/([a-z0-9-]+)",
+    re.IGNORECASE,
+)
+LANG_LABEL = {"es": "ES 🇪🇸", "de": "DE 🇩🇪", "fr": "FR 🇫🇷"}
+
 
 def render():
     st.header("Check Internal & External Links in Google Docs")
@@ -25,6 +31,8 @@ def render():
 
     if not require_auth():
         return
+
+    check_ml = st.checkbox("🌐 Check Multilingual Pages", key="check_ml")
 
     with st.form("check_links_form"):
         doc_url = st.text_input(
@@ -39,6 +47,14 @@ def render():
             ),
             height=150,
         )
+        ml_input = ""
+        if st.session_state.get("check_ml"):
+            ml_input = st.text_area(
+                "Pages with multilingual versions — one per line",
+                placeholder="gross-profit-margin\nhttps://trueprofit.io/blog/net-profit",
+                height=150,
+                help="Paste slugs or full blog URLs. The tool finds their /es/, /de/, /fr/ versions in the doc.",
+            )
         submitted = st.form_submit_button("\U0001f50d Check Links", type="primary")
 
     if submitted:
@@ -49,7 +65,7 @@ def render():
             st.error("Please provide at least one URL to check.")
             return
 
-        results = _run_check(doc_url.strip(), urls_input)
+        results = _run_check(doc_url.strip(), urls_input, ml_input, check_ml)
         if results:
             st.session_state["check_links_results"] = results
 
@@ -254,7 +270,44 @@ def _document_text(body_content: list, footnotes: dict, headers: dict, footers: 
     return "\n\n".join(chunks)
 
 
-def _run_check(doc_url: str, urls_input: str):
+def _parse_ml_slugs(text: str) -> set:
+    slugs = set()
+    for line in text.strip().splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        m = re.search(r"/blog/([a-z0-9-]+)", line, re.IGNORECASE)
+        if m:
+            slugs.add(m.group(1).lower())
+        elif re.match(r"^[a-z0-9-]+$", line):
+            slugs.add(line.lower())
+    return slugs
+
+
+def _find_ml_links(found_links: list, ml_slugs: set) -> list:
+    results = []
+    seen = set()
+    for url, anchor in found_links:
+        m = RE_ML_LINK.search(url)
+        if not m:
+            continue
+        lang = m.group(1).lower()
+        slug = m.group(2).lower()
+        if ml_slugs and slug not in ml_slugs:
+            continue
+        key = (lang, slug)
+        if key in seen:
+            continue
+        seen.add(key)
+        results.append({
+            "Language": LANG_LABEL.get(lang, lang.upper()),
+            "URL": url,
+            "Anchor Text": anchor or "—",
+        })
+    return sorted(results, key=lambda x: (x["Language"], x["URL"]))
+
+
+def _run_check(doc_url: str, urls_input: str, ml_input: str = "", check_ml: bool = False):
     m = re.search(r"/document/d/([a-zA-Z0-9_-]+)", doc_url)
     if not m:
         st.error("Invalid Google Doc URL. Please use the full URL from your browser.")
@@ -304,6 +357,9 @@ def _run_check(doc_url: str, urls_input: str):
     with st.spinner("Checking URL status codes..."):
         status_codes = _check_status_codes(status_urls)
 
+    ml_slugs = _parse_ml_slugs(ml_input) if check_ml else set()
+    ml_links = _find_ml_links([(u, a) for u, a in normalized], ml_slugs) if check_ml else []
+
     return {
         "unique": [(u, a, status_codes.get(u, "N/A")) for u, a in unique],
         "target_count": len(target_urls),
@@ -319,6 +375,8 @@ def _run_check(doc_url: str, urls_input: str):
         ],
         "deepseek_suggestions": [],
         "claude_suggestions": [],
+        "check_ml": check_ml,
+        "multilingual_links": ml_links,
     }
 
 
@@ -392,6 +450,15 @@ def _render_results(results: dict):
             )
         else:
             st.success("No duplicate links found.")
+
+    if results.get("check_ml"):
+        st.subheader("🌐 Multilingual Links Found in Document")
+        ml_links = results.get("multilingual_links") or []
+        if ml_links:
+            df_ml = pd.DataFrame(ml_links)
+            _render_selectable_table(df_ml, "check_links_table_ml", "Multilingual links", copy_column="URL")
+        else:
+            st.info("No multilingual links (ES/DE/FR) found for the provided pages.")
 
     missing_targets = results.get("deepseek_missing_targets") or []
     if missing_targets:
