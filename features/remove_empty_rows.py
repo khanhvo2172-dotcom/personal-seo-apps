@@ -7,7 +7,7 @@ from features.auth import get_credentials, require_auth
 
 def render():
     st.header("Remove Empty Rows in Google Docs")
-    st.caption("Removes empty paragraphs and optionally trims trailing spaces from one or more Google Docs files.")
+    st.caption("Removes empty paragraphs and optionally trims trailing spaces and soft-returns from one or more Google Docs files.")
     _render_guide()
 
     if not require_auth():
@@ -28,9 +28,9 @@ def render():
             horizontal=True,
         )
         trim_spaces = st.checkbox(
-            "Also trim trailing spaces from paragraphs",
+            "Also trim trailing spaces and empty soft-returns within paragraphs",
             value=True,
-            help="Removes invisible spaces/tabs at the end of each paragraph (before the line break).",
+            help="Removes invisible spaces/tabs and trailing soft-returns (Shift+Enter) at the end of each paragraph. A soft-return right before the paragraph break creates a visible empty row at the same indentation as the paragraph above it.",
         )
         submitted = st.form_submit_button("🗑️ Remove Empty Rows", type="primary")
 
@@ -55,7 +55,7 @@ def _render_guide():
 4. Click **Remove Empty Rows**.
 
 Only completely empty paragraphs (no text, no images, no special elements) are removed.
-Optionally, trailing spaces at the end of each paragraph are also trimmed.
+Optionally, trailing spaces and soft-returns (Shift+Enter) at the end of each paragraph are also trimmed — this catches the case where a numbered-list item ends with a bare Shift+Enter, which creates a visible empty row at the list's indentation level.
 If a tab URL is provided, only that tab is processed. Otherwise the first tab is used.
         """.strip())
 
@@ -179,7 +179,7 @@ def _collect_trailing_space_ranges(content: list) -> list[dict]:
         if not text.endswith("\n"):
             continue
         before_newline = text[:-1]
-        stripped = before_newline.rstrip(" \t")
+        stripped = before_newline.rstrip(" \t\x0b")
         trailing_len = len(before_newline) - len(stripped)
         if trailing_len > 0:
             end_idx = last_el.get("endIndex")
