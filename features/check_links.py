@@ -18,6 +18,10 @@ RE_ML_LINK = re.compile(
     r"https?://(?:www\.)?trueprofit\.io/(es|de|fr)/blog/([a-z0-9-]+)",
     re.IGNORECASE,
 )
+RE_EN_BLOG = re.compile(
+    r"https?://(?:www\.)?trueprofit\.io/blog/([a-z0-9-]+)",
+    re.IGNORECASE,
+)
 LANG_LABEL = {"es": "ES 🇪🇸", "de": "DE 🇩🇪", "fr": "FR 🇫🇷"}
 
 
@@ -307,6 +311,23 @@ def _find_ml_links(found_links: list, ml_slugs: set) -> list:
     return sorted(results, key=lambda x: (x["Language"], x["URL"]))
 
 
+def _find_english_ml_links(found_links: list, ml_slugs: set) -> list:
+    results = []
+    seen = set()
+    for url, anchor in found_links:
+        m = RE_EN_BLOG.search(url)
+        if not m:
+            continue
+        slug = m.group(1).lower()
+        if not ml_slugs or slug not in ml_slugs:
+            continue
+        if slug in seen:
+            continue
+        seen.add(slug)
+        results.append({"URL": url, "Anchor Text": anchor or "—"})
+    return sorted(results, key=lambda x: x["URL"])
+
+
 def _run_check(doc_url: str, urls_input: str, ml_input: str = "", check_ml: bool = False):
     m = re.search(r"/document/d/([a-zA-Z0-9_-]+)", doc_url)
     if not m:
@@ -359,6 +380,7 @@ def _run_check(doc_url: str, urls_input: str, ml_input: str = "", check_ml: bool
 
     ml_slugs = _parse_ml_slugs(ml_input) if check_ml else set()
     ml_links = _find_ml_links([(u, a) for u, a in normalized], ml_slugs) if check_ml else []
+    english_ml_links = _find_english_ml_links([(u, a) for u, a in normalized], ml_slugs) if check_ml else []
 
     return {
         "unique": [(u, a, status_codes.get(u, "N/A")) for u, a in unique],
@@ -377,6 +399,7 @@ def _run_check(doc_url: str, urls_input: str, ml_input: str = "", check_ml: bool
         "claude_suggestions": [],
         "check_ml": check_ml,
         "multilingual_links": ml_links,
+        "english_ml_links": english_ml_links,
     }
 
 
@@ -459,6 +482,15 @@ def _render_results(results: dict):
             _render_selectable_table(df_ml, "check_links_table_ml", "Multilingual links", copy_column="URL")
         else:
             st.info("No multilingual links (ES/DE/FR) found for the provided pages.")
+
+    if results.get("check_ml"):
+        st.subheader("⚠️ Still-English Links (multilingual version available)")
+        eng_links = results.get("english_ml_links") or []
+        if eng_links:
+            df_eng = pd.DataFrame(eng_links)
+            _render_selectable_table(df_eng, "check_links_table_eng_ml", "Still-English links", copy_column="URL")
+        else:
+            st.success("No English-version links found for pages that have multilingual versions.")
 
     missing_targets = results.get("deepseek_missing_targets") or []
     if missing_targets:
