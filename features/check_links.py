@@ -7,7 +7,7 @@ import streamlit as st
 import streamlit.components.v1 as components
 from collections import Counter
 from concurrent.futures import ThreadPoolExecutor, as_completed
-from urllib.parse import urlsplit, urlunsplit, unquote
+from urllib.parse import urlsplit, urlunsplit, unquote, urlparse, parse_qs
 from features.auth import get_credentials, require_auth
 
 STATUS_CHECK_TIMEOUT = 8
@@ -39,7 +39,7 @@ def render():
             ),
             height=150,
         )
-        submitted = st.form_submit_button("🔍 Check Links", type="primary")
+        submitted = st.form_submit_button("\U0001f50d Check Links", type="primary")
 
     if submitted:
         if not doc_url.strip():
@@ -70,12 +70,14 @@ def _render_quick_guide():
 7. Review all links found, target URLs missing from the document, and duplicate links.
 8. Use the DeepSeek or Claude 4.6 button only when you want anchor text suggestions for missing links.
 
+If your document has multiple tabs, paste the URL with the tab selected (e.g. `?tab=t.0`) to check that specific tab.
+
 Use this before publishing or updating SEO content to confirm important internal links and external citations are present.
             """.strip()
         )
 
 
-# ── helpers ──────────────────────────────────────────────────
+# ── helpers ──────────────────────────────────────────────
 
 def _normalize(url: str) -> str:
     if not url:
@@ -88,6 +90,51 @@ def _normalize(url: str) -> str:
         parts.query,
         parts.fragment,
     ))
+
+
+def _parse_tab_id(url: str) -> str | None:
+    """Extract tab ID from a Google Doc URL query parameter (e.g. ?tab=t.0)."""
+    params = parse_qs(urlparse(url).query)
+    tabs = params.get("tab", [])
+    return tabs[0] if tabs else None
+
+
+def _find_tab(tabs: list, tab_id: str) -> dict | None:
+    """Recursively find a tab by tabId, including nested child tabs."""
+    for tab in tabs:
+        if tab.get("tabProperties", {}).get("tabId") == tab_id:
+            return tab
+        child = _find_tab(tab.get("childTabs", []), tab_id)
+        if child:
+            return child
+    return None
+
+
+def _get_tab_data(doc: dict, tab_id: str | None) -> tuple:
+    """Return (body_content, footnotes, headers, footers) for the target tab.
+
+    When the document has a tabs structure, select the tab whose tabId matches
+    tab_id. If tab_id is None or not found, fall back to the first tab.
+    For legacy single-tab documents (no tabs key), use doc["body"] directly.
+    """
+    tabs = doc.get("tabs", [])
+    if tabs:
+        target_tab = _find_tab(tabs, tab_id) if tab_id else None
+        if target_tab is None:
+            target_tab = tabs[0]
+        doc_tab = target_tab.get("documentTab", {})
+        return (
+            doc_tab.get("body", {}).get("content", []),
+            doc_tab.get("footnotes", {}),
+            doc_tab.get("headers", {}),
+            doc_tab.get("footers", {}),
+        )
+    return (
+        doc.get("body", {}).get("content", []),
+        doc.get("footnotes", {}),
+        doc.get("headers", {}),
+        doc.get("footers", {}),
+    )
 
 
 def _find_links(elements: list, found: list):
@@ -198,11 +245,11 @@ def _title_from_url(url: str) -> str:
     return slug.title() if slug else url
 
 
-def _document_text(doc: dict) -> str:
+def _document_text(body_content: list, footnotes: dict, headers: dict, footers: dict) -> str:
     chunks: list[str] = []
-    _extract_text(doc.get("body", {}).get("content", []), chunks)
-    for part in ("footnotes", "headers", "footers"):
-        for item in doc.get(part, {}).values():
+    _extract_text(body_content, chunks)
+    for part_dict in (footnotes, headers, footers):
+        for item in part_dict.values():
             _extract_text(item.get("content", []), chunks)
     return "\n\n".join(chunks)
 
@@ -213,6 +260,7 @@ def _run_check(doc_url: str, urls_input: str):
         st.error("Invalid Google Doc URL. Please use the full URL from your browser.")
         return
     doc_id = m.group(1)
+    tab_id = _parse_tab_id(doc_url)
 
     creds = get_credentials()
 
@@ -222,7 +270,7 @@ def _run_check(doc_url: str, urls_input: str):
             from googleapiclient.errors import HttpError
 
             docs = build("docs", "v1", credentials=creds)
-            doc = docs.documents().get(documentId=doc_id).execute()
+            doc = docs.documents().get(documentId=doc_id, includeTabsContent=True).execute()
         except Exception as e:
             err = str(e)
             if "403" in err:
@@ -233,11 +281,13 @@ def _run_check(doc_url: str, urls_input: str):
                 st.error(f"Failed to fetch document: {e}")
             return None
 
+    body_content, footnotes, headers, footers = _get_tab_data(doc, tab_id)
+
     # Collect links from body, headers, footers, footnotes
     raw: list = []
-    _find_links(doc.get("body", {}).get("content", []), raw)
-    for part in ("footnotes", "headers", "footers"):
-        for item in doc.get(part, {}).values():
+    _find_links(body_content, raw)
+    for part_dict in (footnotes, headers, footers):
+        for item in part_dict.values():
             _find_links(item.get("content", []), raw)
 
     normalized = [(n, a) for u, a in raw if (n := _normalize(u))]
@@ -262,7 +312,7 @@ def _run_check(doc_url: str, urls_input: str):
             for u in missing
         ],
         "duplicates": [(u, c, status_codes.get(u, "N/A")) for u, c in duplicates],
-        "deepseek_doc_text": _document_text(doc),
+        "deepseek_doc_text": _document_text(body_content, footnotes, headers, footers),
         "deepseek_missing_targets": [
             {"url": u, "title": target_url_titles.get(u, "")}
             for u in missing
@@ -284,7 +334,7 @@ def _render_results(results: dict):
 
     st.subheader("✅ All Links Found in Document")
     pd.set_option("display.max_colwidth", None)
-    df_found = pd.DataFrame(unique, columns=["🔗 Link", "💬 Anchor Text", "Status Code"])
+    df_found = pd.DataFrame(unique, columns=["\U0001f517 Link", "\U0001f4ac Anchor Text", "Status Code"])
     df_found.insert(0, "#", range(1, len(df_found) + 1))
     df_found = _filter_dataframe(
         df_found,
@@ -298,13 +348,13 @@ def _render_results(results: dict):
         df_found,
         "check_links_table_found",
         "All links",
-        copy_column="🔗 Link",
+        copy_column="\U0001f517 Link",
     )
 
     col1, col2 = st.columns(2)
 
     with col1:
-        st.subheader("🚫 Missing Links")
+        st.subheader("\U0001f6ab Missing Links")
         if missing:
             df_missing = pd.DataFrame(missing, columns=["URL", "Title", "Status Code"])
             df_missing = _filter_dataframe(
@@ -325,7 +375,7 @@ def _render_results(results: dict):
             st.success("All target URLs are present in the document.")
 
     with col2:
-        st.subheader("🔁 Duplicate Links (> 1 occurrence)")
+        st.subheader("\U0001f501 Duplicate Links (> 1 occurrence)")
         if duplicates:
             df_duplicates = _filter_dataframe(
                 pd.DataFrame(duplicates, columns=["URL", "Count", "Status Code"]),
