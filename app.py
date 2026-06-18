@@ -100,6 +100,22 @@ def _apply_style():
             background: var(--g-bg);
         }
 
+        /* ── Feature page titles ───────────────────────────── */
+        .block-container h1 {
+            font-size: 2.4rem !important;
+            font-weight: 600 !important;
+        }
+
+        .block-container h2 {
+            font-size: 2rem !important;
+            font-weight: 600 !important;
+        }
+
+        .block-container h3 {
+            font-size: 1.4rem !important;
+            font-weight: 500 !important;
+        }
+
         /* ── Dark sidebar shell ────────────────────────────── */
         [data-testid="stSidebar"] {
             background: linear-gradient(180deg, #141829 0%, #1a1f33 55%, #1c2238 100%) !important;
@@ -257,31 +273,23 @@ def _apply_style():
 
 def _render_sidebar() -> str:
     with st.sidebar:
-        # ── Premium dark header ──────────────────────────────
+        # ── Sidebar header (no icon) ─────────────────────────
         st.markdown(
             """
-            <div style="padding:14px 4px 18px 4px;
+            <div style="padding:16px 4px 18px 4px;
                         border-bottom:1px solid rgba(255,255,255,0.08);
                         margin-bottom:10px;">
-                <div style="display:flex;align-items:center;gap:11px;margin-bottom:6px;">
-                    <div style="width:35px;height:35px;
-                                background:linear-gradient(135deg,#4285F4 0%,#1967D2 100%);
-                                border-radius:10px;
-                                display:flex;align-items:center;justify-content:center;
-                                font-size:18px;flex-shrink:0;
-                                box-shadow:0 4px 12px rgba(66,133,244,0.45);">
-                        🔷
-                    </div>
-                    <div style="font-family:'Google Sans','Roboto',sans-serif;
-                                font-size:17px;font-weight:600;
-                                color:#e2e7f0;letter-spacing:0.2px;">
-                        Personal Tools
-                    </div>
+                <div style="font-family:'Google Sans','Roboto',sans-serif;
+                            font-size:20px;font-weight:700;
+                            color:#e2e7f0;letter-spacing:0.3px;
+                            margin-bottom:5px;">
+                    Personal Tools
                 </div>
-                <div style="color:#3a4560;font-size:10px;padding-left:46px;
+                <div style="color:#e2e7f0;font-size:11px;
                             font-family:'Roboto',sans-serif;
-                            letter-spacing:1.2px;text-transform:uppercase;font-weight:500;">
-                    SEO Utilities
+                            letter-spacing:0.3px;font-weight:400;
+                            opacity:0.55;">
+                    Created by Khanh (and AI)
                 </div>
             </div>
             """,
