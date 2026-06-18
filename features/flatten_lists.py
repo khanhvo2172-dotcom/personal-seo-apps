@@ -19,11 +19,12 @@ def render():
     with st.form("flatten_lists_form"):
         doc_url = st.text_input(
             "Google Doc URL",
-            placeholder="https://docs.google.com/document/d/.../edit",
-            help=(
-                "Paste with ?tab=t.xxx to process a single tab, "
-                "or without a tab to process ALL tabs."
-            ),
+            placeholder="https://docs.google.com/document/d/.../edit?tab=t.0",
+        )
+        tab_scope = st.radio(
+            "Which tabs to process?",
+            options=["Just this tab", "All tabs"],
+            horizontal=True,
         )
         submitted = st.form_submit_button("\U0001f4cb Flatten Numbered Lists", type="primary")
 
@@ -31,12 +32,12 @@ def render():
         if not doc_url.strip():
             st.error("Please provide a Google Doc URL.")
             return
-        _run_flatten(doc_url.strip())
+        _run_flatten(doc_url.strip(), all_tabs=(tab_scope == "All tabs"))
 
 
 # ── main logic ─────────────────────────────────────────────────────────────────
 
-def _run_flatten(doc_url: str):
+def _run_flatten(doc_url: str, all_tabs: bool):
     m = re.search(r"/document/d/([a-zA-Z0-9_-]+)", doc_url)
     if not m:
         st.error("Invalid Google Doc URL. Please use the full URL from your browser.")
@@ -63,44 +64,44 @@ def _run_flatten(doc_url: str):
                 st.error(f"Failed to fetch document: {e}")
             return
 
-    # Decide which tabs to process
-    all_tabs = _collect_all_tabs(doc.get("tabs", []))
-    if tab_id:
-        target_tabs = [t for t in all_tabs if t.get("tabProperties", {}).get("tabId") == tab_id]
-        if not target_tabs:
-            st.error(f"Tab '{tab_id}' not found in this document.")
-            return
-    else:
-        target_tabs = all_tabs if all_tabs else []
-
-    # If no tabs structure, fall back to legacy single-tab
+    all_doc_tabs = _collect_all_tabs(doc.get("tabs", []))
     use_legacy = not bool(doc.get("tabs", []))
 
-    # Collect numbered list items per tab
+    if all_tabs:
+        target_tabs = all_doc_tabs
+    else:
+        # "Just this tab" — use the tab from the URL, or first tab if none specified
+        if tab_id:
+            target_tabs = [t for t in all_doc_tabs if t.get("tabProperties", {}).get("tabId") == tab_id]
+            if not target_tabs:
+                st.error(f"Tab '{tab_id}' not found in this document.")
+                return
+        else:
+            target_tabs = all_doc_tabs[:1] if all_doc_tabs else []
+
+    # Collect numbered list items
     items: list[dict] = []
     if use_legacy:
         lists_def = doc.get("lists", {})
-        counters: dict = {}
         _collect_list_items(
             doc.get("body", {}).get("content", []),
-            lists_def, counters, tab_id=None, items=items,
+            lists_def, {}, tab_id=None, items=items,
         )
     else:
         for tab in target_tabs:
             t_id = tab.get("tabProperties", {}).get("tabId", "")
             doc_tab = tab.get("documentTab", {})
             lists_def = doc_tab.get("lists", doc.get("lists", {}))
-            counters = {}
             _collect_list_items(
                 doc_tab.get("body", {}).get("content", []),
-                lists_def, counters, tab_id=t_id, items=items,
+                lists_def, {}, tab_id=t_id, items=items,
             )
 
     if not items:
         st.info("No numbered list items found in the selected tab(s).")
         return
 
-    # Build batchUpdate requests (reverse order per tab so indices stay valid)
+    # Build batchUpdate requests — reverse order per tab so indices stay valid
     by_tab: dict[str | None, list] = defaultdict(list)
     for item in items:
         by_tab[item["tabId"]].append(item)
@@ -114,12 +115,11 @@ def _run_flatten(doc_url: str):
             if t_id is not None:
                 rng["tabId"] = t_id
                 loc["tabId"] = t_id
-
             requests.append({"deleteParagraphBullets": {"range": rng}})
             requests.append({"insertText": {"location": loc, "text": item["prefix"]}})
 
-    tab_label = f"tab '{tab_id}'" if tab_id else f"{len(by_tab)} tab(s)"
-    with st.spinner(f"Applying {len(items)} change(s) across {tab_label}…"):
+    scope_label = "all tabs" if all_tabs else f"tab '{tab_id or 'first'}'"
+    with st.spinner(f"Applying {len(items)} change(s) across {scope_label}…"):
         try:
             docs_service.documents().batchUpdate(
                 documentId=doc_id,
@@ -131,7 +131,7 @@ def _run_flatten(doc_url: str):
 
     st.success(
         f"Done! Converted {len(items)} numbered list item(s) to plain text "
-        f"across {tab_label}."
+        f"across {scope_label}."
     )
 
 
@@ -147,24 +147,19 @@ def _collect_list_items(
             start_idx = el.get("startIndex", 0)
             end_idx = el.get("endIndex", 0)
             bullet = para.get("bullet")
-
             if bullet:
                 list_id = bullet.get("listId", "")
                 nesting = bullet.get("nestingLevel", 0)
-
                 nesting_levels = (
                     lists_def.get(list_id, {})
                     .get("listProperties", {})
                     .get("nestingLevels", [])
                 )
                 ld = nesting_levels[nesting] if nesting < len(nesting_levels) else {}
-
                 glyph_type = ld.get("glyphType", "")
                 glyph_format = ld.get("glyphFormat", "%0.")
                 start_number = ld.get("startNumber", 1)
-
                 key = (list_id, nesting)
-
                 if glyph_type and glyph_type != "GLYPH_TYPE_UNSPECIFIED":
                     if key not in counters:
                         counters[key] = start_number
@@ -179,7 +174,6 @@ def _collect_list_items(
                         "endIndex": end_idx,
                         "prefix": prefix,
                     })
-
         elif "table" in el:
             for row in el["table"].get("tableRows", []):
                 for cell in row.get("tableCells", []):
