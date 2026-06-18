@@ -46,7 +46,17 @@ FEATURES = {
     "Autofill Column": autofill_column.render,
 }
 
-# Keep feature_order in sync with FEATURES (handles code-level additions/removals)
+FEATURE_ICONS = {
+    "Settings": "⚙️",
+    "Humanizer - AI detection": "🤖",
+    "Check Internal & External Links in Google Docs": "🔗",
+    "Format Google Docs File": "🛠️",
+    "Extract & Optimize Images from Google Docs": "🖼️",
+    "Download Images using GDrive Links": "⬇️",
+    "Keyword Grouping": "🏷️",
+    "Autofill Column": "📊",
+}
+
 if "feature_order" not in st.session_state:
     st.session_state.feature_order = list(FEATURES.keys())
 else:
@@ -62,7 +72,7 @@ def _apply_style():
     st.markdown(
         """
         <style>
-        @import url('https://fonts.googleapis.com/css2?family=Google+Sans:wght@400;500;700&family=Roboto:wght@300;400;500;700&display=swap');
+        @import url('https://fonts.googleapis.com/css2?family=Google+Sans:wght@400;500;600;700&family=Roboto:wght@300;400;500;700&display=swap');
 
         :root {
             --g-blue: #4285F4;
@@ -79,11 +89,6 @@ def _apply_style():
             font-family: 'Roboto', sans-serif !important;
         }
 
-        .material-icons, .material-symbols-rounded,
-        .material-symbols-outlined, [data-icon] {
-            font-family: 'Material Icons' !important;
-        }
-
         h1, h2, h3, h4, h5, h6 {
             font-family: 'Google Sans', 'Roboto', sans-serif !important;
             font-weight: 500;
@@ -95,16 +100,88 @@ def _apply_style():
             background: var(--g-bg);
         }
 
+        /* ── Dark sidebar shell ────────────────────────────── */
         [data-testid="stSidebar"] {
-            background: var(--g-surface);
-            border-right: 1px solid var(--g-border);
+            background: linear-gradient(180deg, #141829 0%, #1a1f33 55%, #1c2238 100%) !important;
+            border-right: 1px solid rgba(255,255,255,0.06) !important;
+            box-shadow: 4px 0 30px rgba(0,0,0,0.4);
+        }
+
+        [data-testid="stSidebar"]::-webkit-scrollbar { width: 3px; }
+        [data-testid="stSidebar"]::-webkit-scrollbar-track { background: transparent; }
+        [data-testid="stSidebar"]::-webkit-scrollbar-thumb {
+            background: rgba(255,255,255,0.1);
+            border-radius: 4px;
         }
 
         [data-testid="stSidebar"] [data-testid="stMarkdownContainer"] p {
-            color: var(--g-text-muted);
+            color: #3e4a68 !important;
             font-size: 12px;
         }
 
+        /* ── Nav buttons — base ────────────────────────────── */
+        [data-testid="stSidebar"] .stButton > button {
+            width: 100%;
+            display: flex;
+            justify-content: flex-start !important;
+            align-items: center;
+            background: transparent !important;
+            border: 1px solid transparent !important;
+            border-radius: 10px !important;
+            color: #6e7a95 !important;
+            font-family: 'Roboto', sans-serif !important;
+            font-weight: 400 !important;
+            font-size: 13.5px !important;
+            padding: 9px 14px !important;
+            text-align: left !important;
+            box-shadow: none !important;
+            transition: background 0.18s ease, color 0.18s ease,
+                        border-color 0.18s ease, transform 0.14s ease,
+                        box-shadow 0.18s ease !important;
+            letter-spacing: 0.2px;
+            margin-bottom: 2px;
+        }
+
+        [data-testid="stSidebar"] .stButton > button div,
+        [data-testid="stSidebar"] .stButton > button [data-testid="stMarkdownContainer"],
+        [data-testid="stSidebar"] .stButton > button p {
+            width: 100% !important;
+            text-align: left !important;
+            color: inherit !important;
+            justify-content: flex-start !important;
+            display: block !important;
+        }
+
+        /* ── Nav buttons — hover ───────────────────────────── */
+        [data-testid="stSidebar"] .stButton > button:hover {
+            background: rgba(255,255,255,0.07) !important;
+            color: #c4cde0 !important;
+            border-color: rgba(255,255,255,0.08) !important;
+            transform: translateX(3px) !important;
+            box-shadow: none !important;
+        }
+
+        /* ── Nav buttons — active / selected ──────────────── */
+        [data-testid="stSidebar"] .stButton > button[kind="primary"] {
+            background: linear-gradient(135deg,
+                rgba(66,133,244,0.22) 0%,
+                rgba(26,115,232,0.12) 100%) !important;
+            border: 1px solid rgba(66,133,244,0.32) !important;
+            color: #93bbfc !important;
+            font-weight: 500 !important;
+            box-shadow:
+                0 2px 14px rgba(66,133,244,0.18),
+                inset 0 1px 0 rgba(255,255,255,0.06) !important;
+        }
+
+        [data-testid="stSidebar"] .stButton > button[kind="primary"]:hover {
+            background: linear-gradient(135deg,
+                rgba(66,133,244,0.32) 0%,
+                rgba(26,115,232,0.2) 100%) !important;
+            transform: translateX(3px) !important;
+        }
+
+        /* ── Main content area ─────────────────────────────── */
         .block-container {
             max-width: 1180px;
             padding-top: 2rem;
@@ -143,51 +220,6 @@ def _apply_style():
             border: 1px solid var(--g-border);
             transition: background 0.2s, box-shadow 0.2s;
         }
-
-        [data-testid="stSidebar"] .stButton > button {
-            width: 100%;
-            display: flex;
-            justify-content: flex-start !important;
-            align-items: center;
-            background: transparent;
-            border: none;
-            border-radius: 24px;
-            color: var(--g-text);
-            font-weight: 400;
-            font-size: 14px;
-            padding: 0.5rem 1rem;
-            text-align: left !important;
-            box-shadow: none;
-        }
-
-        [data-testid="stSidebar"] .stButton > button div,
-        [data-testid="stSidebar"] .stButton > button [data-testid="stMarkdownContainer"] {
-            width: 100%;
-            justify-content: flex-start !important;
-            text-align: left !important;
-        }
-
-        [data-testid="stSidebar"] .stButton > button p {
-            width: 100%;
-            display: block;
-            text-align: left !important;
-        }
-
-        [data-testid="stSidebar"] .stButton > button:hover {
-            background: #f1f3f4 !important;
-            color: var(--g-text) !important;
-            box-shadow: none !important;
-        }
-
-        [data-testid="stSidebar"] .stButton > button[kind="primary"] {
-            background: var(--g-blue-light) !important;
-            color: var(--g-blue-dark) !important;
-            font-weight: 500 !important;
-        }
-
-        [data-testid="stSidebar"] .stButton > button[kind="primary"]:hover {
-            background: #d2e3fc !important;
-        }
         </style>
         """,
         unsafe_allow_html=True,
@@ -225,22 +257,44 @@ def _apply_style():
 
 def _render_sidebar() -> str:
     with st.sidebar:
+        # ── Premium dark header ──────────────────────────────
         st.markdown(
             """
-            <div style="padding:8px 0 16px 0; border-bottom:1px solid #dadce0; margin-bottom:8px;">
-                <div style="font-family:'Google Sans','Roboto',sans-serif; font-size:20px; font-weight:500; color:#202124; line-height:1.3;">
-                    <span style="color:#4285F4">P</span><span style="color:#DB4437">e</span><span style="color:#F4B400">r</span><span style="color:#4285F4">s</span><span style="color:#0F9D58">o</span><span style="color:#DB4437">n</span><span style="color:#F4B400">a</span><span style="color:#4285F4">l</span>&nbsp;Tools
+            <div style="padding:14px 4px 18px 4px;
+                        border-bottom:1px solid rgba(255,255,255,0.08);
+                        margin-bottom:10px;">
+                <div style="display:flex;align-items:center;gap:11px;margin-bottom:6px;">
+                    <div style="width:35px;height:35px;
+                                background:linear-gradient(135deg,#4285F4 0%,#1967D2 100%);
+                                border-radius:10px;
+                                display:flex;align-items:center;justify-content:center;
+                                font-size:18px;flex-shrink:0;
+                                box-shadow:0 4px 12px rgba(66,133,244,0.45);">
+                        🔷
+                    </div>
+                    <div style="font-family:'Google Sans','Roboto',sans-serif;
+                                font-size:17px;font-weight:600;
+                                color:#e2e7f0;letter-spacing:0.2px;">
+                        Personal Tools
+                    </div>
                 </div>
-                <div style="color:#5f6368; font-size:12px; margin-top:4px; font-family:'Roboto',sans-serif;">SEO utilities</div>
+                <div style="color:#3a4560;font-size:10px;padding-left:46px;
+                            font-family:'Roboto',sans-serif;
+                            letter-spacing:1.2px;text-transform:uppercase;font-weight:500;">
+                    SEO Utilities
+                </div>
             </div>
             """,
             unsafe_allow_html=True,
         )
-        st.write("")
 
         if st.session_state.reorder_mode:
             st.markdown(
-                "<div style='color:#5f6368;font-size:12px;margin-bottom:6px;'>Drag items to reorder</div>",
+                """<div style='background:rgba(66,133,244,0.1);
+                              border:1px solid rgba(66,133,244,0.25);
+                              border-radius:8px;padding:8px 12px;margin-bottom:10px;
+                              color:#6a9fd8;font-size:12px;letter-spacing:0.3px;'>
+                    ⇕&nbsp; Drag items to reorder</div>""",
                 unsafe_allow_html=True,
             )
             new_order = sort_items(
@@ -262,9 +316,10 @@ def _render_sidebar() -> str:
                     st.rerun()
         else:
             for feature_name in st.session_state.feature_order:
+                icon = FEATURE_ICONS.get(feature_name, "▪️")
                 is_active = st.session_state.selected_feature == feature_name
                 if st.button(
-                    feature_name,
+                    f"{icon}  {feature_name}",
                     key=f"nav_{feature_name}",
                     type="primary" if is_active else "secondary",
                     use_container_width=True,
@@ -273,11 +328,12 @@ def _render_sidebar() -> str:
                     st.rerun()
 
             st.markdown(
-                "<hr style='margin:10px 0 6px 0;border:none;border-top:1px solid #dadce0;'>",
+                """<hr style='margin:12px 0 8px 0;border:none;
+                               border-top:1px solid rgba(255,255,255,0.07);'>""",
                 unsafe_allow_html=True,
             )
             if st.button(
-                "⇕ Reorder",
+                "⇕  Reorder",
                 use_container_width=True,
                 help="Drag and drop to change the sidebar order",
             ):
