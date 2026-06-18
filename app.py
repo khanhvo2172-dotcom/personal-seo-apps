@@ -18,7 +18,6 @@ if "google_signed_out" not in st.session_state:
 if "selected_feature" not in st.session_state:
     st.session_state.selected_feature = "Settings"
 
-# When Google redirects back with ?code=, land on Settings so the callback is processed
 if "code" in st.query_params:
     st.session_state.selected_feature = "Settings"
 
@@ -27,10 +26,9 @@ from features import (
     check_links,
     download_gdrive_images,
     extract_optimize_images,
-    flatten_lists,
+    format_gdocs,
     humanizer,
     keyword_grouping,
-    remove_empty_rows,
     settings,
 )
 
@@ -38,12 +36,11 @@ FEATURES = {
     "Settings": settings.render,
     "Humanizer - AI detection": humanizer.render,
     "Check Internal & External Links in Google Docs": check_links.render,
-    "Flatten Numbered Lists in Google Docs": flatten_lists.render,
+    "Format Google Docs File": format_gdocs.render,
     "Extract & Optimize Images from Google Docs": extract_optimize_images.render,
     "Download Images using GDrive Links": download_gdrive_images.render,
     "Keyword Grouping": keyword_grouping.render,
     "Autofill Column": autofill_column.render,
-    "Remove Empty Rows in Google Docs": remove_empty_rows.render,
 }
 
 
@@ -68,7 +65,6 @@ def _apply_style():
             font-family: 'Roboto', sans-serif !important;
         }
 
-        /* Exclude Material Icons spans from font override */
         .material-icons, .material-symbols-rounded,
         .material-symbols-outlined, [data-icon] {
             font-family: 'Material Icons' !important;
@@ -205,7 +201,7 @@ def _apply_style():
                 });
             }
         } catch (error) {
-            // No-op: browser copy still works if the parent document is unavailable.
+            // No-op
         }
         </script>
         """,
