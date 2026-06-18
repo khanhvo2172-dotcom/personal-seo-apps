@@ -1,6 +1,7 @@
 import streamlit as st
 import streamlit.components.v1 as components
 from dotenv import load_dotenv
+from streamlit_sortables import sort_items
 
 load_dotenv()
 
@@ -17,6 +18,8 @@ if "google_signed_out" not in st.session_state:
     st.session_state.google_signed_out = False
 if "selected_feature" not in st.session_state:
     st.session_state.selected_feature = "Settings"
+if "reorder_mode" not in st.session_state:
+    st.session_state.reorder_mode = False
 
 if "code" in st.query_params:
     st.session_state.selected_feature = "Settings"
@@ -42,6 +45,17 @@ FEATURES = {
     "Keyword Grouping": keyword_grouping.render,
     "Autofill Column": autofill_column.render,
 }
+
+# Keep feature_order in sync with FEATURES (handles code-level additions/removals)
+if "feature_order" not in st.session_state:
+    st.session_state.feature_order = list(FEATURES.keys())
+else:
+    current = st.session_state.feature_order
+    all_keys = list(FEATURES.keys())
+    st.session_state.feature_order = (
+        [f for f in current if f in FEATURES]
+        + [f for f in all_keys if f not in current]
+    )
 
 
 def _apply_style():
@@ -174,7 +188,6 @@ def _apply_style():
         [data-testid="stSidebar"] .stButton > button[kind="primary"]:hover {
             background: #d2e3fc !important;
         }
-
         </style>
         """,
         unsafe_allow_html=True,
@@ -224,16 +237,53 @@ def _render_sidebar() -> str:
             unsafe_allow_html=True,
         )
         st.write("")
-        for feature_name in FEATURES:
-            is_active = st.session_state.selected_feature == feature_name
+
+        if st.session_state.reorder_mode:
+            st.markdown(
+                "<div style='color:#5f6368;font-size:12px;margin-bottom:6px;'>Drag items to reorder</div>",
+                unsafe_allow_html=True,
+            )
+            new_order = sort_items(
+                st.session_state.feature_order,
+                direction="vertical",
+            )
+            if new_order != st.session_state.feature_order:
+                st.session_state.feature_order = new_order
+
+            col1, col2 = st.columns(2)
+            with col1:
+                if st.button("Done", type="primary", use_container_width=True):
+                    st.session_state.reorder_mode = False
+                    st.rerun()
+            with col2:
+                if st.button("Reset", use_container_width=True):
+                    st.session_state.feature_order = list(FEATURES.keys())
+                    st.session_state.reorder_mode = False
+                    st.rerun()
+        else:
+            for feature_name in st.session_state.feature_order:
+                is_active = st.session_state.selected_feature == feature_name
+                if st.button(
+                    feature_name,
+                    key=f"nav_{feature_name}",
+                    type="primary" if is_active else "secondary",
+                    use_container_width=True,
+                ):
+                    st.session_state.selected_feature = feature_name
+                    st.rerun()
+
+            st.markdown(
+                "<hr style='margin:10px 0 6px 0;border:none;border-top:1px solid #dadce0;'>",
+                unsafe_allow_html=True,
+            )
             if st.button(
-                feature_name,
-                key=f"nav_{feature_name}",
-                type="primary" if is_active else "secondary",
+                "⇕ Reorder",
                 use_container_width=True,
+                help="Drag and drop to change the sidebar order",
             ):
-                st.session_state.selected_feature = feature_name
+                st.session_state.reorder_mode = True
                 st.rerun()
+
         return st.session_state.selected_feature
 
 
