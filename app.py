@@ -26,6 +26,7 @@ if "code" in st.query_params:
 
 from features import (
     autofill_column,
+    bulk_check_dr,
     check_links,
     download_gdrive_images,
     extract_optimize_images,
@@ -43,6 +44,7 @@ FEATURES = {
     "Extract & Optimize Images from Google Docs": extract_optimize_images.render,
     "Download Images using GDrive Links": download_gdrive_images.render,
     "Keyword Grouping": keyword_grouping.render,
+    "Bulk Check Ahrefs DR": bulk_check_dr.render,
     "Autofill Column": autofill_column.render,
 }
 
@@ -54,6 +56,7 @@ FEATURE_ICONS = {
     "Extract & Optimize Images from Google Docs": "🖼️",
     "Download Images using GDrive Links": "⬇️",
     "Keyword Grouping": "🏷️",
+    "Bulk Check Ahrefs DR": "📈",
     "Autofill Column": "📊",
 }
 
