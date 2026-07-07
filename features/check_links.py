@@ -7,12 +7,23 @@ import streamlit as st
 import streamlit.components.v1 as components
 from collections import Counter
 from concurrent.futures import ThreadPoolExecutor, as_completed
-from urllib.parse import urlsplit, urlunsplit, unquote, urlparse, parse_qs
+from urllib.parse import urlsplit, urlunsplit, unquote, urlparse, parse_qs, urljoin
+from bs4 import BeautifulSoup, NavigableString, Tag
 from features.auth import get_credentials, require_auth
 
 STATUS_CHECK_TIMEOUT = 8
 STATUS_CHECK_WORKERS = 10
 CLAUDE_DEFAULT_MODEL = "claude-sonnet-4-20250514"
+
+BLOG_FETCH_TIMEOUT = 20
+# Author-bio block that marks the end of the article body on trueprofit.io.
+# The Next.js CSS-module class is hashed (e.g. "style_wrap-bio__oleBA"); the
+# second, un-hashed class "wrap-bio" is the stable marker.
+BIO_MARKER_CLASS = "wrap-bio"
+# Auto-inserted Shopify App Store banner CTAs (image-wrapped, empty anchor).
+# The skill defines these as site chrome, not editorial links, so they are
+# filtered out of the blog-body link extraction.
+RE_BANNER_CTA = re.compile(r"utm_campaign=in-blog-banner", re.IGNORECASE)
 
 RE_ML_LINK = re.compile(
     r"https?://(?:www\.)?trueprofit\.io/(es|de|fr)/blog/([a-z0-9-]+)",
@@ -25,24 +36,50 @@ RE_EN_BLOG = re.compile(
 LANG_LABEL = {"es": "ES 🇪🇸", "de": "DE 🇩🇪", "fr": "FR 🇫🇷"}
 
 
+SOURCE_DOC = "📄 Google Doc"
+SOURCE_BLOG = "🌍 TrueProfit's Blog URL"
+
+
 def render():
     st.header("Check Internal & External Links in Google Docs")
     st.caption(
-        "Checks which of your target URLs appear in a Google Doc, "
-        "and identifies missing or duplicate links."
+        "Checks which of your target URLs appear in a Google Doc or a live "
+        "TrueProfit blog page, and identifies missing or duplicate links."
     )
     _render_quick_guide()
 
-    if not require_auth():
+    source = st.radio(
+        "Where should I read the links from?",
+        [SOURCE_DOC, SOURCE_BLOG],
+        horizontal=True,
+        key="check_links_source",
+        help="A Google Doc source, or the live article body of a trueprofit.io/blog page.",
+    )
+
+    # Google auth is only needed to read a Google Doc; the blog mode is public.
+    if source == SOURCE_DOC and not require_auth():
         return
 
     check_ml = st.checkbox("🌐 Check Multilingual Pages", key="check_ml")
 
     with st.form("check_links_form"):
-        doc_url = st.text_input(
-            "Google Doc URL",
-            placeholder="https://docs.google.com/document/d/.../edit",
-        )
+        doc_url = ""
+        blog_url = ""
+        if source == SOURCE_DOC:
+            doc_url = st.text_input(
+                "Google Doc URL",
+                placeholder="https://docs.google.com/document/d/.../edit",
+            )
+        else:
+            blog_url = st.text_input(
+                "TrueProfit's Blog URL",
+                placeholder="https://trueprofit.io/blog/gross-profit-margin",
+                help=(
+                    "Reads only the article body: from the H1 heading down to "
+                    "(but not including) the author bio, FAQ included. Nav, "
+                    "footer, related posts and auto banner CTAs are skipped."
+                ),
+            )
         urls_input = st.text_area(
             "URLs to check — one per line",
             placeholder=(
@@ -56,20 +93,26 @@ def render():
             ml_input = st.text_area(
                 "Pages with multilingual versions — one per line",
                 placeholder="gross-profit-margin\nhttps://trueprofit.io/blog/net-profit",
-                height=150,
-                help="Paste slugs or full blog URLs. The tool finds their /es/, /de/, /fr/ versions in the doc.",
+                help="Paste slugs or full blog URLs. The tool finds their /es/, /de/, /fr/ versions in the source.",
             )
         submitted = st.form_submit_button("\U0001f50d Check Links", type="primary")
 
     if submitted:
-        if not doc_url.strip():
-            st.error("Please provide a Google Doc URL.")
-            return
         if not urls_input.strip():
             st.error("Please provide at least one URL to check.")
             return
 
-        results = _run_check(doc_url.strip(), urls_input, ml_input, check_ml)
+        if source == SOURCE_DOC:
+            if not doc_url.strip():
+                st.error("Please provide a Google Doc URL.")
+                return
+            results = _run_check(doc_url.strip(), urls_input, ml_input, check_ml)
+        else:
+            if not blog_url.strip():
+                st.error("Please provide a TrueProfit blog URL.")
+                return
+            results = _run_check_blog(blog_url.strip(), urls_input, ml_input, check_ml)
+
         if results:
             st.session_state["check_links_results"] = results
 
@@ -81,16 +124,18 @@ def _render_quick_guide():
     with st.expander("How this works"):
         st.markdown(
             """
-1. Authenticate with Google in **Settings**.
-2. Paste the Google Doc URL you want to inspect.
-3. Paste the internal or external URLs you expect to find, one URL per line.
-4. Add optional page titles after each URL with `|`, tab, comma, or ` - `.
-5. Click **Check Links**.
-6. The app reads links from the document body, tables, headers, footers, footnotes, linked images, and rich links.
-7. Review all links found, target URLs missing from the document, and duplicate links.
-8. Use the DeepSeek or Claude 4.6 button only when you want anchor text suggestions for missing links.
+**Pick a source:**
 
-If your document has multiple tabs, paste the URL with the tab selected (e.g. `?tab=t.0`) to check that specific tab.
+- **📄 Google Doc** — authenticate with Google in **Settings**, then paste the Doc URL. Links are read from the document body, tables, headers, footers, footnotes, linked images, and rich links. If the document has multiple tabs, paste the URL with the tab selected (e.g. `?tab=t.0`) to check that specific tab.
+- **🌍 TrueProfit's Blog URL** — no Google login needed. Paste a live `trueprofit.io/blog/...` URL. The app fetches the page and reads links only from the **article body**: from the H1 heading down to (but not including) the author-bio block, with the FAQ section included. Navigation, header/footer, related-post blocks and auto-inserted banner CTAs (`utm_campaign=in-blog-banner-*`) are skipped.
+
+**Then:**
+
+1. Paste the internal or external URLs you expect to find, one URL per line.
+2. Add optional page titles after each URL with `|`, tab, comma, or ` - `.
+3. Click **Check Links**.
+4. Review all links found, target URLs missing from the source, and duplicate links.
+5. Use the DeepSeek or Claude 4.6 button only when you want anchor text suggestions for missing links.
 
 Use this before publishing or updating SEO content to confirm important internal links and external citations are present.
             """.strip()
@@ -364,6 +409,101 @@ def _run_check(doc_url: str, urls_input: str, ml_input: str = "", check_ml: bool
         for item in part_dict.values():
             _find_links(item.get("content", []), raw)
 
+    doc_text = _document_text(body_content, footnotes, headers, footers)
+    return _analyze_links(raw, urls_input, ml_input, check_ml, doc_text)
+
+
+def _run_check_blog(blog_url: str, urls_input: str, ml_input: str = "", check_ml: bool = False):
+    """Fetch a live TrueProfit blog page and analyze its article-body links.
+
+    The article body range mirrors the compare-content skill: start at the H1
+    heading, stop just before the author-bio block (``div.wrap-bio``), keep the
+    FAQ, and skip site chrome and auto banner CTAs.
+    """
+    if not re.match(r"^https?://", blog_url, re.IGNORECASE):
+        st.error("Invalid URL. Please paste the full blog URL, including https://.")
+        return None
+
+    with st.spinner("Fetching blog page…"):
+        try:
+            resp = requests.get(
+                blog_url,
+                timeout=BLOG_FETCH_TIMEOUT,
+                headers={"User-Agent": "Mozilla/5.0"},
+            )
+            resp.raise_for_status()
+        except requests.RequestException as e:
+            st.error(f"Could not fetch the page: {e}")
+            return None
+
+    raw, article_text, bio_found = _extract_blog_article(resp.text, blog_url)
+
+    if not raw:
+        st.warning(
+            "No links were found in the article body. Double-check the URL points "
+            "to a live blog article."
+        )
+    elif not bio_found:
+        st.info(
+            "Couldn't find the author-bio marker on this page, so links were read "
+            "from the H1 to the end of the page. Results may include footer links."
+        )
+
+    return _analyze_links(raw, urls_input, ml_input, check_ml, article_text)
+
+
+def _has_class(target: str):
+    """Return a bs4 class matcher that is True when *target* is one of the
+    element's classes (handles the multi-class Next.js CSS-module lists)."""
+    def _match(value):
+        if not value:
+            return False
+        classes = value if isinstance(value, list) else str(value).split()
+        return target in classes
+    return _match
+
+
+def _extract_blog_article(html: str, base_url: str) -> tuple[list, str, bool]:
+    """Extract (links, article_text, bio_found) from a blog page's article body.
+
+    Links are returned as (absolute_url, anchor_text) pairs, in reading order,
+    for everything between the first <h1> and the author-bio block.
+    """
+    soup = BeautifulSoup(html, "html.parser")
+    for tag in soup(["script", "style", "noscript", "template"]):
+        tag.decompose()
+
+    h1 = soup.find("h1")
+    start = h1 or soup.body or soup
+    bio = soup.find(class_=_has_class(BIO_MARKER_CLASS))
+
+    links: list[tuple[str, str]] = []
+    text_parts: list[str] = []
+    for el in start.next_elements:
+        if bio is not None and el is bio:
+            break
+        if isinstance(el, Tag) and el.name == "a":
+            href = (el.get("href") or "").strip()
+            if not href or href.startswith(("#", "javascript:", "mailto:", "tel:")):
+                continue
+            if RE_BANNER_CTA.search(href):
+                continue
+            full = urljoin(base_url, href)
+            anchor = el.get_text(" ", strip=True)
+            if not anchor and el.find("img"):
+                anchor = "embedded in image"
+            links.append((full, anchor))
+        elif isinstance(el, NavigableString):
+            chunk = str(el).strip()
+            if chunk:
+                text_parts.append(chunk)
+
+    return links, " ".join(text_parts), bio is not None
+
+
+def _analyze_links(raw: list, urls_input: str, ml_input: str, check_ml: bool, doc_text: str):
+    """Shared analysis for both sources: compare found links against targets,
+    detect duplicates, check status codes, and build the result dict."""
     normalized = [(n, a) for u, a in raw if (n := _normalize(u))]
     unique = list(dict.fromkeys(normalized))
 
@@ -379,8 +519,8 @@ def _run_check(doc_url: str, urls_input: str, ml_input: str = "", check_ml: bool
         status_codes = _check_status_codes(status_urls)
 
     ml_slugs = _parse_ml_slugs(ml_input) if check_ml else set()
-    ml_links = _find_ml_links([(u, a) for u, a in normalized], ml_slugs) if check_ml else []
-    english_ml_links = _find_english_ml_links([(u, a) for u, a in normalized], ml_slugs) if check_ml else []
+    ml_links = _find_ml_links(normalized, ml_slugs) if check_ml else []
+    english_ml_links = _find_english_ml_links(normalized, ml_slugs) if check_ml else []
 
     return {
         "unique": [(u, a, status_codes.get(u, "N/A")) for u, a in unique],
@@ -390,7 +530,7 @@ def _run_check(doc_url: str, urls_input: str, ml_input: str = "", check_ml: bool
             for u in missing
         ],
         "duplicates": [(u, c, status_codes.get(u, "N/A")) for u, c in duplicates],
-        "deepseek_doc_text": _document_text(body_content, footnotes, headers, footers),
+        "deepseek_doc_text": doc_text,
         "deepseek_missing_targets": [
             {"url": u, "title": target_url_titles.get(u, "")}
             for u in missing
