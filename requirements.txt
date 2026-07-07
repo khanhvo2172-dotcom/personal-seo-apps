@@ -10,3 +10,4 @@ gdown
 cloudinary
 openpyxl
 streamlit-sortables
+beautifulsoup4
