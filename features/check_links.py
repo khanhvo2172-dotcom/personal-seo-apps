@@ -38,6 +38,7 @@ LANG_LABEL = {"es": "ES 🇪🇸", "de": "DE 🇩🇪", "fr": "FR 🇫🇷"}
 
 SOURCE_DOC = "📄 Google Doc"
 SOURCE_BLOG = "🌍 TrueProfit's Blog URL"
+SOURCE_MULTI = "🗂️ Multiple Blog URLs"
 
 
 def render():
@@ -50,27 +51,35 @@ def render():
 
     source = st.radio(
         "Where should I read the links from?",
-        [SOURCE_DOC, SOURCE_BLOG],
+        [SOURCE_DOC, SOURCE_BLOG, SOURCE_MULTI],
         horizontal=True,
         key="check_links_source",
-        help="A Google Doc source, or the live article body of a trueprofit.io/blog page.",
+        help=(
+            "A Google Doc, one live trueprofit.io/blog page, or a batch of "
+            "blog pages for a multilingual link audit."
+        ),
     )
 
-    # Google auth is only needed to read a Google Doc; the blog mode is public.
+    # Google auth is only needed to read a Google Doc; the blog modes are public.
     if source == SOURCE_DOC and not require_auth():
         return
 
-    check_ml = st.checkbox("🌐 Check Multilingual Pages", key="check_ml")
+    # The single-source modes offer an optional multilingual check; the
+    # multi-URL mode is itself a multilingual audit, so it's always on there.
+    check_ml = False
+    if source in (SOURCE_DOC, SOURCE_BLOG):
+        check_ml = st.checkbox("🌐 Check Multilingual Pages", key="check_ml")
 
     with st.form("check_links_form"):
         doc_url = ""
         blog_url = ""
+        blog_urls_text = ""
         if source == SOURCE_DOC:
             doc_url = st.text_input(
                 "Google Doc URL",
                 placeholder="https://docs.google.com/document/d/.../edit",
             )
-        else:
+        elif source == SOURCE_BLOG:
             blog_url = st.text_input(
                 "TrueProfit's Blog URL",
                 placeholder="https://trueprofit.io/blog/gross-profit-margin",
@@ -80,44 +89,78 @@ def render():
                     "footer, related posts and auto banner CTAs are skipped."
                 ),
             )
-        urls_input = st.text_area(
-            "URLs to check — one per line",
-            placeholder=(
-                "https://www.example.com/page-1 | Page 1 title\n"
-                "https://www.example.com/page-2"
-            ),
-            height=150,
-        )
+        else:  # SOURCE_MULTI
+            blog_urls_text = st.text_area(
+                "TrueProfit blog URLs — one per line",
+                placeholder=(
+                    "https://trueprofit.io/blog/gross-profit-margin\n"
+                    "https://trueprofit.io/blog/net-profit-margin\n"
+                    "https://trueprofit.io/blog/what-is-pnl"
+                ),
+                height=150,
+                help="Each page's article body is scanned the same way as single blog mode.",
+            )
+
+        urls_input = ""
+        if source in (SOURCE_DOC, SOURCE_BLOG):
+            urls_input = st.text_area(
+                "URLs to check — one per line",
+                placeholder=(
+                    "https://www.example.com/page-1 | Page 1 title\n"
+                    "https://www.example.com/page-2"
+                ),
+                height=150,
+            )
+
         ml_input = ""
-        if st.session_state.get("check_ml"):
+        show_ml_box = source == SOURCE_MULTI or st.session_state.get("check_ml")
+        if show_ml_box:
+            ml_help = (
+                "Paste slugs or full blog URLs of pages that HAVE localized "
+                "versions. A blog link is flagged 'still English' when it points "
+                "to one of these in English."
+                if source == SOURCE_MULTI
+                else "Paste slugs or full blog URLs. The tool finds their /es/, /de/, /fr/ versions in the source."
+            )
             ml_input = st.text_area(
                 "Pages with multilingual versions — one per line",
                 placeholder="gross-profit-margin\nhttps://trueprofit.io/blog/net-profit",
-                help="Paste slugs or full blog URLs. The tool finds their /es/, /de/, /fr/ versions in the source.",
+                help=ml_help,
             )
+
         submitted = st.form_submit_button("\U0001f50d Check Links", type="primary")
 
     if submitted:
-        if not urls_input.strip():
-            st.error("Please provide at least one URL to check.")
-            return
-
-        if source == SOURCE_DOC:
-            if not doc_url.strip():
-                st.error("Please provide a Google Doc URL.")
+        if source == SOURCE_MULTI:
+            blog_urls = _parse_blog_url_list(blog_urls_text)
+            if not blog_urls:
+                st.error("Please provide at least one blog URL.")
                 return
-            results = _run_check(doc_url.strip(), urls_input, ml_input, check_ml)
+            results = _run_check_multi(blog_urls, ml_input)
         else:
-            if not blog_url.strip():
-                st.error("Please provide a TrueProfit blog URL.")
+            if not urls_input.strip():
+                st.error("Please provide at least one URL to check.")
                 return
-            results = _run_check_blog(blog_url.strip(), urls_input, ml_input, check_ml)
+            if source == SOURCE_DOC:
+                if not doc_url.strip():
+                    st.error("Please provide a Google Doc URL.")
+                    return
+                results = _run_check(doc_url.strip(), urls_input, ml_input, check_ml)
+            else:
+                if not blog_url.strip():
+                    st.error("Please provide a TrueProfit blog URL.")
+                    return
+                results = _run_check_blog(blog_url.strip(), urls_input, ml_input, check_ml)
 
         if results:
             st.session_state["check_links_results"] = results
 
     if "check_links_results" in st.session_state:
-        _render_results(st.session_state["check_links_results"])
+        results = st.session_state["check_links_results"]
+        if results.get("mode") == "multi":
+            _render_results_multi(results)
+        else:
+            _render_results(results)
 
 
 def _render_quick_guide():
@@ -129,15 +172,11 @@ def _render_quick_guide():
 - **📄 Google Doc** — authenticate with Google in **Settings**, then paste the Doc URL. Links are read from the document body, tables, headers, footers, footnotes, linked images, and rich links. If the document has multiple tabs, paste the URL with the tab selected (e.g. `?tab=t.0`) to check that specific tab.
 - **🌍 TrueProfit's Blog URL** — no Google login needed. Paste a live `trueprofit.io/blog/...` URL. The app fetches the page and reads links only from the **article body**: from the H1 heading down to (but not including) the author-bio block, with the FAQ section included. Navigation, header/footer, related-post blocks and auto-inserted banner CTAs (`utm_campaign=in-blog-banner-*`) are skipped.
 
-**Then:**
+For a **Google Doc** or **single blog URL**: paste the internal/external URLs you expect to find (one per line, optional `|` title), click **Check Links**, then review all links found, the ones missing from the source, and duplicates. The DeepSeek / Claude 4.6 buttons suggest anchor text for missing links.
 
-1. Paste the internal or external URLs you expect to find, one URL per line.
-2. Add optional page titles after each URL with `|`, tab, comma, or ` - `.
-3. Click **Check Links**.
-4. Review all links found, target URLs missing from the source, and duplicate links.
-5. Use the DeepSeek or Claude 4.6 button only when you want anchor text suggestions for missing links.
+- **🗂️ Multiple Blog URLs** — a batch **multilingual audit**. Paste several `trueprofit.io/blog/...` URLs (one per line) plus the list of pages that have localized (ES/DE/FR) versions. There's no target list, and no missing/duplicate check. You get: every link found across all pages, all multilingual links found, and — most useful — a **Still-English** table that flags which links, on which input page, still point to the English version even though a localized one exists.
 
-Use this before publishing or updating SEO content to confirm important internal links and external citations are present.
+Use this before publishing or updating SEO content to confirm important internal links and external citations are present, and to catch un-localized internal links at scale.
             """.strip()
         )
 
@@ -425,18 +464,12 @@ def _run_check_blog(blog_url: str, urls_input: str, ml_input: str = "", check_ml
         return None
 
     with st.spinner("Fetching blog page…"):
-        try:
-            resp = requests.get(
-                blog_url,
-                timeout=BLOG_FETCH_TIMEOUT,
-                headers={"User-Agent": "Mozilla/5.0"},
-            )
-            resp.raise_for_status()
-        except requests.RequestException as e:
-            st.error(f"Could not fetch the page: {e}")
-            return None
+        html, err = _fetch_blog_html(blog_url)
+    if err:
+        st.error(f"Could not fetch the page: {err}")
+        return None
 
-    raw, article_text, bio_found = _extract_blog_article(resp.text, blog_url)
+    raw, article_text, bio_found = _extract_blog_article(html, blog_url)
 
     if not raw:
         st.warning(
@@ -523,6 +556,7 @@ def _analyze_links(raw: list, urls_input: str, ml_input: str, check_ml: bool, do
     english_ml_links = _find_english_ml_links(normalized, ml_slugs) if check_ml else []
 
     return {
+        "mode": "single",
         "unique": [(u, a, status_codes.get(u, "N/A")) for u, a in unique],
         "target_count": len(target_urls),
         "missing": [
@@ -540,6 +574,94 @@ def _analyze_links(raw: list, urls_input: str, ml_input: str, check_ml: bool, do
         "check_ml": check_ml,
         "multilingual_links": ml_links,
         "english_ml_links": english_ml_links,
+    }
+
+
+def _fetch_blog_html(url: str) -> tuple[str | None, str | None]:
+    """Fetch a page's HTML. Returns (html, None) on success or (None, error)."""
+    if not re.match(r"^https?://", url, re.IGNORECASE):
+        return None, "Not a valid URL (must start with http:// or https://)."
+    try:
+        resp = requests.get(
+            url,
+            timeout=BLOG_FETCH_TIMEOUT,
+            headers={"User-Agent": "Mozilla/5.0"},
+        )
+        resp.raise_for_status()
+        return resp.text, None
+    except requests.RequestException as e:
+        return None, str(e)
+
+
+def _parse_blog_url_list(text: str) -> list[str]:
+    """Extract blog URLs from a multi-line textarea, one URL per line, deduped."""
+    seen: set[str] = set()
+    urls: list[str] = []
+    for line in (text or "").strip().splitlines():
+        m = re.search(r"https?://\S+", line.strip())
+        if not m:
+            continue
+        url = m.group(0).rstrip("),.;]")
+        if url not in seen:
+            seen.add(url)
+            urls.append(url)
+    return urls
+
+
+def _run_check_multi(blog_urls: list[str], ml_input: str):
+    """Batch multilingual audit over several TrueProfit blog URLs.
+
+    Merges links from every page into one result set (no missing/duplicate
+    logic), lists all multilingual links found, and flags English links that
+    have a localized version — each tagged with the input page it was found on.
+    """
+    ml_slugs = _parse_ml_slugs(ml_input)
+
+    # Fetch all pages concurrently.
+    with st.spinner(f"Fetching {len(blog_urls)} blog page(s)…"):
+        fetched: dict[str, tuple[str | None, str | None]] = {}
+        with ThreadPoolExecutor(max_workers=STATUS_CHECK_WORKERS) as executor:
+            futures = {executor.submit(_fetch_blog_html, u): u for u in blog_urls}
+            for future in as_completed(futures):
+                fetched[futures[future]] = future.result()
+
+    all_normalized: list[tuple[str, str]] = []
+    still_english_rows: list[dict] = []
+    fetch_errors: list[tuple[str, str]] = []
+
+    # Preserve the user's input order when iterating.
+    for url in blog_urls:
+        html, err = fetched.get(url, (None, "No response"))
+        if err or html is None:
+            fetch_errors.append((url, err or "No response"))
+            continue
+        raw, _text, _bio = _extract_blog_article(html, url)
+        normalized = [(n, a) for u, a in raw if (n := _normalize(u))]
+        all_normalized.extend(normalized)
+        for row in _find_english_ml_links(normalized, ml_slugs):
+            still_english_rows.append({
+                "Input URL": url,
+                "English Link": row["URL"],
+                "Anchor Text": row["Anchor Text"],
+            })
+
+    unique = list(dict.fromkeys(all_normalized))
+    status_urls = sorted({u for u, _ in unique})
+    with st.spinner("Checking URL status codes..."):
+        status_codes = _check_status_codes(status_urls)
+
+    # "Multilingual links found" lists every ES/DE/FR link across all pages
+    # (not slug-filtered) so the user sees which localized links are in use.
+    ml_links = _find_ml_links(all_normalized, set())
+
+    return {
+        "mode": "multi",
+        "input_count": len(blog_urls),
+        "had_ml_slugs": bool(ml_slugs),
+        "unique": [(u, a, status_codes.get(u, "N/A")) for u, a in unique],
+        "multilingual_links": ml_links,
+        "english_ml_links_multi": still_english_rows,
+        "fetch_errors": fetch_errors,
     }
 
 
@@ -684,6 +806,77 @@ def _render_results(results: dict):
             "check_links_table_claude",
             "Claude 4.6 suggestions",
         )
+
+
+def _render_results_multi(results: dict):
+    unique = _with_status(results.get("unique", []), "unique")
+    fetch_errors = results.get("fetch_errors") or []
+    scanned = results["input_count"] - len(fetch_errors)
+
+    st.success(
+        f"Scanned **{scanned}** of **{results['input_count']}** blog URL(s). "
+        f"Found **{len(unique)}** unique links across them."
+    )
+
+    if fetch_errors:
+        with st.expander(f"⚠️ {len(fetch_errors)} URL(s) could not be fetched"):
+            for url, err in fetch_errors:
+                st.markdown(f"- `{url}` — {err}")
+
+    st.subheader("✅ All Links Found (all pages)")
+    df_found = pd.DataFrame(unique, columns=["\U0001f517 Link", "\U0001f4ac Anchor Text", "Status Code"])
+    df_found.insert(0, "#", range(1, len(df_found) + 1))
+    df_found = _filter_dataframe(
+        df_found,
+        _render_filter(
+            "Filter all links",
+            "check_links_multi_filter_found",
+            "Type part of a URL, anchor text, or status code...",
+        ),
+    )
+    _render_selectable_table(
+        df_found,
+        "check_links_multi_table_found",
+        "All links",
+        copy_column="\U0001f517 Link",
+    )
+
+    st.subheader("🌐 Multilingual Links Found (all pages)")
+    ml_links = results.get("multilingual_links") or []
+    if ml_links:
+        df_ml = pd.DataFrame(ml_links)
+        _render_selectable_table(df_ml, "check_links_multi_table_ml", "Multilingual links", copy_column="URL")
+    else:
+        st.info("No multilingual links (ES/DE/FR) were found in any of the pages.")
+
+    st.subheader("⚠️ Still-English Links (multilingual version available)")
+    st.caption(
+        "English links found across your pages that point to a page you listed "
+        "as having a localized version — grouped by the input page they appear on."
+    )
+    still_english = results.get("english_ml_links_multi") or []
+    if still_english:
+        df_se = _filter_dataframe(
+            pd.DataFrame(still_english, columns=["Input URL", "English Link", "Anchor Text"]),
+            _render_filter(
+                "Filter still-English links",
+                "check_links_multi_filter_eng",
+                "Type part of an input URL, link, or anchor text...",
+            ),
+        )
+        _render_selectable_table(
+            df_se,
+            "check_links_multi_table_eng",
+            "Still-English links",
+            copy_column="English Link",
+        )
+    elif not results.get("had_ml_slugs"):
+        st.info(
+            "Add pages under **Pages with multilingual versions** to flag "
+            "internal links that still point to their English version."
+        )
+    else:
+        st.success("No still-English links found for the pages you listed.")
 
 
 def _render_filter(label: str, key: str, placeholder: str) -> str:
