@@ -26,13 +26,18 @@ def render():
         height=200,
     )
     zip_name = st.text_input("ZIP filename (without extension)", value="downloaded_images")
+    optimize_names = st.checkbox(
+        "Optimize Thumbnail File Name",
+        help='Renames each file to slug-case with "-thumbnail" appended, e.g. '
+        '"automate shopify reports" → "automate-shopify-reports-thumbnail".',
+    )
 
     if st.button("⬇️ Download & ZIP", type="primary"):
         if not links_raw.strip():
             st.error("Please paste at least one Google Drive link.")
             return
         links = [ln.strip() for ln in links_raw.splitlines() if ln.strip()]
-        _run_download(links, zip_name.strip() or "downloaded_images")
+        _run_download(links, zip_name.strip() or "downloaded_images", optimize_names)
 
 
 def _render_quick_guide():
@@ -227,6 +232,26 @@ def _download_with_drive_api(file_id: str, output_dir: str) -> str | None:
     return str(out_path)
 
 
+def _thumbnail_filename(name: str) -> str:
+    stem, suffix = Path(name).stem, Path(name).suffix
+    slug = re.sub(r"[^a-zA-Z0-9]+", "-", stem).strip("-").lower()
+    return f"{slug}-thumbnail{suffix}"
+
+
+def _rename_for_thumbnail(path: str) -> str:
+    src = Path(path)
+    base_name = _thumbnail_filename(src.name)
+    base_stem, suffix = Path(base_name).stem, Path(base_name).suffix
+    dst = src.with_name(base_name)
+    counter = 2
+    while dst.exists() and dst != src:
+        dst = src.with_name(f"{base_stem}_{counter}{suffix}")
+        counter += 1
+    if dst != src:
+        src.rename(dst)
+    return str(dst)
+
+
 def _download_gdrive_file(file_id: str, output_dir: str) -> str:
     try:
         return _download_public_file(file_id, output_dir)
@@ -237,7 +262,7 @@ def _download_gdrive_file(file_id: str, output_dir: str) -> str:
         raise public_error
 
 
-def _run_download(links: list[str], zip_name: str):
+def _run_download(links: list[str], zip_name: str, optimize_names: bool = False):
 
     log_area = st.empty()
     logs: list[str] = []
@@ -259,6 +284,8 @@ def _run_download(links: list[str], zip_name: str):
             try:
                 out_path = _download_gdrive_file(file_id, tmp_dir)
                 if out_path and Path(out_path).exists():
+                    if optimize_names:
+                        out_path = _rename_for_thumbnail(out_path)
                     downloaded_paths.append(out_path)
                     logs.append(f"[{i}/{len(links)}] ✅  Saved → {Path(out_path).name}")
                 else:
