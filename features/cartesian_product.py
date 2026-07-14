@@ -1,7 +1,9 @@
 import itertools
+import json
 
 import pandas as pd
 import streamlit as st
+import streamlit.components.v1 as components
 
 MAX_LISTS = 8
 MAX_COMBINATIONS = 200_000  # safety cap so a huge product can't freeze the app
@@ -127,8 +129,11 @@ def _render_results(result: dict):
     st.success(f"✅ Generated **{len(combos):,}** combinations  ({result['sizes']})")
     st.dataframe(df, use_container_width=True, hide_index=True, height=460)
 
-    c1, c2 = st.columns(2)
+    txt = "\n".join(combos)
+    c1, c2, c3 = st.columns(3)
     with c1:
+        _copy_button(txt)
+    with c2:
         st.download_button(
             "⬇️ Download as CSV",
             data=df[["Combination"]].to_csv(index=False).encode("utf-8"),
@@ -136,11 +141,74 @@ def _render_results(result: dict):
             mime="text/csv",
             use_container_width=True,
         )
-    with c2:
+    with c3:
         st.download_button(
             "⬇️ Download as TXT",
-            data=("\n".join(combos)).encode("utf-8"),
+            data=txt.encode("utf-8"),
             file_name="cartesian_product.txt",
             mime="text/plain",
             use_container_width=True,
         )
+
+
+def _copy_button(text: str):
+    """Clipboard 'Copy all' button. Runs inside a component iframe, so it is not
+    affected by the app-wide Ctrl+C guard; falls back to execCommand when the
+    async clipboard API is blocked by the iframe permissions policy."""
+    payload = json.dumps(text)
+    components.html(
+        f"""
+        <style>
+        .cp-btn {{
+            width: 100%;
+            height: 38px;
+            font-family: 'Google Sans','Roboto',sans-serif;
+            font-weight: 500;
+            font-size: 14px;
+            letter-spacing: .25px;
+            color: #1d2939;
+            background: #fff;
+            border: 1px solid #dadce0;
+            border-radius: 4px;
+            cursor: pointer;
+            transition: background .18s, box-shadow .18s, border-color .18s;
+        }}
+        .cp-btn:hover {{
+            background: #f8f9fa;
+            border-color: #4285F4;
+            box-shadow: 0 1px 2px rgba(60,64,67,.15);
+        }}
+        .cp-btn.copied {{ color: #0c9d61; border-color: #0c9d61; }}
+        </style>
+        <button class="cp-btn" id="cpbtn">📋 Copy all</button>
+        <script>
+        const data = {payload};
+        const btn = document.getElementById('cpbtn');
+        btn.addEventListener('click', async () => {{
+            let ok = false;
+            try {{
+                await navigator.clipboard.writeText(data);
+                ok = true;
+            }} catch (e) {{
+                try {{
+                    const ta = document.createElement('textarea');
+                    ta.value = data;
+                    ta.style.position = 'fixed';
+                    ta.style.opacity = '0';
+                    document.body.appendChild(ta);
+                    ta.focus(); ta.select();
+                    ok = document.execCommand('copy');
+                    ta.remove();
+                }} catch (e2) {{ ok = false; }}
+            }}
+            btn.textContent = ok ? '✅ Copied!' : '⚠️ Press Ctrl+C';
+            btn.classList.toggle('copied', ok);
+            setTimeout(() => {{
+                btn.textContent = '📋 Copy all';
+                btn.classList.remove('copied');
+            }}, 1600);
+        }});
+        </script>
+        """,
+        height=46,
+    )
