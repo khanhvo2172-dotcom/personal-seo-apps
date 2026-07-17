@@ -73,21 +73,22 @@ def render():
     with st.form("yst_form"):
         keywords_raw = ""
         links_raw = ""
+        ids_raw = ""
         video_type = "Both"
         top_n = 5
-        uploaded_csv = None
 
         if mode == MODE_CHECK:
-            st.markdown(
-                "Upload a **CSV exported by this tool** from a previous run. "
-                "Each comment is re-checked by its Comment ID and marked "
-                "**Live** or **Deleted / hidden**."
-            )
-            uploaded_csv = st.file_uploader(
-                "Previous results CSV",
-                type=["csv"],
-                help="Use the '⬇️ Download as CSV' file from an earlier scan. "
-                "It must contain the 'Comment ID' column.",
+            ids_raw = st.text_area(
+                "Comment IDs — one per line",
+                placeholder=(
+                    "UgxK2AbCdEfGhIjKlMn4AaABAg\n"
+                    "UgzQwErTyUiOpAsDfGh4AaABAg.AbCdEfGhIjK\n"
+                    "…paste the 'Comment ID' column from a previous export"
+                ),
+                height=220,
+                help="Copy the Comment ID column from an earlier scan's results "
+                "(commas, spaces, or new lines all work as separators). Each ID "
+                "is re-checked and marked Live or Deleted / hidden.",
             )
         elif mode == MODE_KEYWORDS:
             keywords_raw = st.text_area(
@@ -143,10 +144,7 @@ def render():
         return
 
     if mode == MODE_CHECK:
-        if uploaded_csv is None:
-            st.error("Please upload a results CSV from a previous run.")
-            return
-        _run_deletion_check(api_key, uploaded_csv)
+        _run_deletion_check(api_key, ids_raw)
         return
 
     names = _parse_channel_names(channels_raw)
@@ -472,33 +470,23 @@ def _fetch_thread_replies(thread_id: str, api_key: str) -> list[tuple[str, str, 
 
 # ── run modes ────────────────────────────────────────────────
 
-def _run_deletion_check(api_key, uploaded_csv):
+def _run_deletion_check(api_key, ids_raw):
     _reset_run_quota()
-    try:
-        df = pd.read_csv(uploaded_csv, dtype=str).fillna("")
-    except Exception as exc:
-        st.error(f"Could not read the CSV: {exc}")
-        return
 
-    if "Comment ID" not in df.columns:
-        st.error(
-            "This CSV has no **Comment ID** column. It was probably exported "
-            "before deletion-checking existed — re-run a scan first, then use "
-            "that new CSV here."
-        )
-        return
-
-    ids = [i.strip() for i in df["Comment ID"].tolist()]
-    unique_ids = sorted({i for i in ids if i})
-    if not unique_ids:
-        st.error("No comment IDs found in the CSV.")
+    ids: list[str] = []
+    for token in re.split(r"[\s,]+", ids_raw or ""):
+        token = token.strip()
+        if token and token not in ids:
+            ids.append(token)
+    if not ids:
+        st.error("Please paste at least one Comment ID.")
         return
 
     live_ids: set[str] = set()
-    with st.spinner(f"Re-checking {len(unique_ids)} comment(s)…"):
+    with st.spinner(f"Re-checking {len(ids)} comment(s)…"):
         try:
-            for i in range(0, len(unique_ids), 50):
-                chunk = unique_ids[i : i + 50]
+            for i in range(0, len(ids), 50):
+                chunk = ids[i : i + 50]
                 data = _yt_get(
                     "comments",
                     {"part": "id", "id": ",".join(chunk)},
@@ -509,11 +497,14 @@ def _run_deletion_check(api_key, uploaded_csv):
             _report_api_error(exc, "re-checking comments")
             return
 
-    df["Status"] = [
-        ("🟢 Live" if i.strip() in live_ids else "🔴 Deleted / hidden") if i.strip()
-        else "⚪ No ID"
-        for i in ids
-    ]
+    df = pd.DataFrame(
+        {
+            "Comment ID": ids,
+            "Status": [
+                "🟢 Live" if i in live_ids else "🔴 Deleted / hidden" for i in ids
+            ],
+        }
+    )
 
     deleted = int((df["Status"] == "🔴 Deleted / hidden").sum())
     live = int((df["Status"] == "🟢 Live").sum())
