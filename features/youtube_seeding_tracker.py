@@ -1,0 +1,522 @@
+import re
+from concurrent.futures import ThreadPoolExecutor, as_completed
+
+import pandas as pd
+import requests
+import streamlit as st
+
+API_BASE = "https://www.googleapis.com/youtube/v3"
+UA_HEADERS = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)"}
+REQUEST_TIMEOUT = 20
+SHORT_MAX_SECONDS = 183      # Shorts can be up to 3 minutes
+MAX_COMMENT_PAGES = 5        # ~500 newest top-level threads per video
+MAX_FULL_REPLY_THREADS = 20  # per video: threads with >5 replies fetched in full
+SHORTS_CHECK_WORKERS = 8
+
+MODE_KEYWORDS = "🔎 Keywords"
+MODE_LINKS = "🔗 Video links"
+
+TYPE_SHORT = "Short"
+TYPE_LONG = "Long Video"
+
+RE_DURATION = re.compile(r"PT(?:(\d+)H)?(?:(\d+)M)?(?:(\d+)S)?")
+RE_VIDEO_ID_PATTERNS = [
+    re.compile(r"youtube\.com/shorts/([\w-]{11})"),
+    re.compile(r"youtube\.com/watch\?[^\s]*v=([\w-]{11})"),
+    re.compile(r"youtu\.be/([\w-]{11})"),
+    re.compile(r"youtube\.com/embed/([\w-]{11})"),
+    re.compile(r"youtube\.com/live/([\w-]{11})"),
+]
+
+
+def render():
+    st.header("YouTube Seeding Tracker")
+    st.caption(
+        "Find the comments your seeding accounts have published — search by "
+        "keyword or paste video links, filter by your channel names."
+    )
+    _render_quick_guide()
+
+    api_key = _get_api_key()
+    if not api_key:
+        return
+
+    mode = st.radio(
+        "Input mode",
+        [MODE_KEYWORDS, MODE_LINKS],
+        horizontal=True,
+        key="yst_mode",
+    )
+
+    with st.form("yst_form"):
+        keywords_raw = ""
+        links_raw = ""
+        video_type = "Both"
+        top_n = 5
+
+        if mode == MODE_KEYWORDS:
+            keywords_raw = st.text_area(
+                "Keywords — one per line",
+                placeholder="profit tracking app\nshopify profit calculator",
+                height=120,
+            )
+            c1, c2 = st.columns(2)
+            with c1:
+                video_type = st.radio(
+                    "Video type",
+                    [TYPE_SHORT, TYPE_LONG, "Both"],
+                    horizontal=True,
+                )
+            with c2:
+                top_n = st.selectbox("Top videos per keyword", [5, 10, 15, 20], index=0)
+        else:
+            links_raw = st.text_area(
+                "YouTube video links — one per line",
+                placeholder=(
+                    "https://www.youtube.com/watch?v=XXXXXXXXXXX\n"
+                    "https://youtu.be/XXXXXXXXXXX\n"
+                    "https://www.youtube.com/shorts/XXXXXXXXXXX"
+                ),
+                height=140,
+            )
+
+        channels_raw = st.text_area(
+            "Seeding channel names — one per line",
+            placeholder="@happyshopper88\n@ecomdiary\nLinda's Store Journey",
+            height=120,
+            help="Paste the names exactly as they appear on the channel "
+            "(with or without the leading @). Matching is case-insensitive.",
+        )
+
+        submitted = st.form_submit_button("🌱 Find seeding comments", type="primary")
+
+    if not submitted:
+        return
+
+    names = _parse_channel_names(channels_raw)
+    if not names:
+        st.error("Please enter at least one seeding channel name.")
+        return
+
+    if mode == MODE_KEYWORDS:
+        keywords = [k.strip() for k in keywords_raw.splitlines() if k.strip()]
+        if not keywords:
+            st.error("Please enter at least one keyword.")
+            return
+        _run_keyword_mode(api_key, keywords, video_type, top_n, names)
+    else:
+        video_ids = _extract_video_ids(links_raw)
+        if not video_ids:
+            st.error("No valid YouTube video links found. Check the URLs and try again.")
+            return
+        _run_links_mode(api_key, video_ids, names)
+
+
+def _render_quick_guide():
+    with st.expander("How this works"):
+        st.markdown(
+            """
+**Keywords mode** — enter keywords, pick Short / Long / Both and how many top
+videos per keyword. The tool searches YouTube (relevance order), classifies each
+result as Short or Long, then scans the selected videos' comments.
+
+**Video links mode** — paste specific video URLs; only those videos are scanned.
+
+In both modes, only comments whose **author name matches your seeding channel
+list** are returned (top-level comments **and** replies).
+
+Notes:
+- Needs a **YouTube Data API v3 key** in the app secrets (`YOUTUBE_API_KEY`).
+- Scans the **~500 newest comment threads** per video — seeding comments are
+  usually recent, so this catches them. Threads with more than 5 replies are
+  fetched in full (up to 20 such threads per video).
+- Shorts are detected via video duration + the `/shorts/` URL check.
+- Quota: a keyword search costs ~100 units, each video ~6 — the free daily
+  quota (10,000) comfortably covers dozens of runs per day.
+            """.strip()
+        )
+
+
+# ── api key ──────────────────────────────────────────────────
+
+def _get_api_key() -> str:
+    key = ""
+    try:
+        key = (st.secrets.get("YOUTUBE_API_KEY") or "").strip()
+    except Exception:
+        key = ""
+    if key:
+        return key
+
+    st.warning(
+        "**YouTube API key not configured.** Add `YOUTUBE_API_KEY = \"...\"` to the "
+        "app secrets (Streamlit Cloud → app → **Settings → Secrets**), or paste a "
+        "key below to use it for this session only."
+    )
+    manual = st.text_input(
+        "YouTube Data API v3 key (session only)",
+        type="password",
+        key="yst_manual_key",
+    )
+    return (manual or "").strip()
+
+
+# ── input parsing ────────────────────────────────────────────
+
+def _norm_name(name: str) -> str:
+    return name.strip().lstrip("@").lower()
+
+
+def _parse_channel_names(text: str) -> set[str]:
+    return {_norm_name(line) for line in (text or "").splitlines() if line.strip()}
+
+
+def _extract_video_ids(text: str) -> list[str]:
+    ids: list[str] = []
+    for line in (text or "").splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        for pattern in RE_VIDEO_ID_PATTERNS:
+            m = pattern.search(line)
+            if m:
+                if m.group(1) not in ids:
+                    ids.append(m.group(1))
+                break
+    return ids
+
+
+# ── YouTube API helpers ──────────────────────────────────────
+
+class YTError(Exception):
+    def __init__(self, message: str, reason: str = ""):
+        super().__init__(message)
+        self.reason = reason
+
+
+def _yt_get(endpoint: str, params: dict, api_key: str) -> dict:
+    resp = requests.get(
+        f"{API_BASE}/{endpoint}",
+        params={**params, "key": api_key},
+        timeout=REQUEST_TIMEOUT,
+    )
+    if resp.status_code == 200:
+        return resp.json()
+
+    reason, message = "", f"HTTP {resp.status_code}"
+    try:
+        err = resp.json().get("error", {})
+        message = err.get("message", message)
+        errors = err.get("errors", [])
+        if errors:
+            reason = errors[0].get("reason", "")
+    except Exception:
+        pass
+    raise YTError(message, reason)
+
+
+def _parse_duration(iso: str) -> int:
+    m = RE_DURATION.fullmatch(iso or "")
+    if not m:
+        return 10**6  # unknown → treat as long
+    h, mi, s = (int(g) if g else 0 for g in m.groups())
+    return h * 3600 + mi * 60 + s
+
+
+def _check_shorts_url(video_id: str) -> bool:
+    """True if youtube.com/shorts/<id> serves directly (i.e. it IS a Short)."""
+    try:
+        resp = requests.get(
+            f"https://www.youtube.com/shorts/{video_id}",
+            headers=UA_HEADERS,
+            allow_redirects=False,
+            timeout=REQUEST_TIMEOUT,
+            stream=True,
+        )
+        resp.close()
+        return resp.status_code == 200
+    except requests.RequestException:
+        return False
+
+
+def _classify_videos(video_ids: list[str], api_key: str) -> dict[str, str]:
+    """Map video_id -> TYPE_SHORT / TYPE_LONG."""
+    durations: dict[str, int] = {}
+    for i in range(0, len(video_ids), 50):
+        chunk = video_ids[i : i + 50]
+        data = _yt_get(
+            "videos",
+            {"part": "contentDetails", "id": ",".join(chunk), "maxResults": 50},
+            api_key,
+        )
+        for item in data.get("items", []):
+            durations[item["id"]] = _parse_duration(
+                item.get("contentDetails", {}).get("duration", "")
+            )
+
+    types: dict[str, str] = {}
+    maybe_short = []
+    for vid in video_ids:
+        if durations.get(vid, 10**6) > SHORT_MAX_SECONDS:
+            types[vid] = TYPE_LONG
+        else:
+            maybe_short.append(vid)
+
+    if maybe_short:
+        with ThreadPoolExecutor(max_workers=SHORTS_CHECK_WORKERS) as pool:
+            futures = {pool.submit(_check_shorts_url, v): v for v in maybe_short}
+            for future in as_completed(futures):
+                vid = futures[future]
+                types[vid] = TYPE_SHORT if future.result() else TYPE_LONG
+    return types
+
+
+def _search_videos(keyword: str, api_key: str) -> list[str]:
+    data = _yt_get(
+        "search",
+        {"part": "id", "type": "video", "q": keyword, "maxResults": 50,
+         "order": "relevance"},
+        api_key,
+    )
+    return [
+        item["id"]["videoId"]
+        for item in data.get("items", [])
+        if item.get("id", {}).get("videoId")
+    ]
+
+
+def _fetch_all_comments(video_id: str, api_key: str) -> list[tuple[str, str]]:
+    """All (author, text) pairs: newest ~500 top-level threads + replies."""
+    comments: list[tuple[str, str]] = []
+    full_reply_budget = MAX_FULL_REPLY_THREADS
+    page_token = None
+
+    for _ in range(MAX_COMMENT_PAGES):
+        params = {
+            "part": "snippet,replies",
+            "videoId": video_id,
+            "maxResults": 100,
+            "order": "time",
+            "textFormat": "plainText",
+        }
+        if page_token:
+            params["pageToken"] = page_token
+        data = _yt_get("commentThreads", params, api_key)
+
+        for thread in data.get("items", []):
+            top = thread["snippet"]["topLevelComment"]["snippet"]
+            comments.append(
+                (top.get("authorDisplayName", ""), top.get("textOriginal", ""))
+            )
+            embedded = thread.get("replies", {}).get("comments", [])
+            total_replies = thread["snippet"].get("totalReplyCount", 0)
+
+            if total_replies > len(embedded) and full_reply_budget > 0:
+                full_reply_budget -= 1
+                comments.extend(_fetch_thread_replies(thread["id"], api_key))
+            else:
+                for reply in embedded:
+                    rs = reply["snippet"]
+                    comments.append(
+                        (rs.get("authorDisplayName", ""), rs.get("textOriginal", ""))
+                    )
+
+        page_token = data.get("nextPageToken")
+        if not page_token:
+            break
+    return comments
+
+
+def _fetch_thread_replies(thread_id: str, api_key: str) -> list[tuple[str, str]]:
+    replies: list[tuple[str, str]] = []
+    page_token = None
+    for _ in range(2):  # up to 200 replies per thread
+        params = {
+            "part": "snippet",
+            "parentId": thread_id,
+            "maxResults": 100,
+            "textFormat": "plainText",
+        }
+        if page_token:
+            params["pageToken"] = page_token
+        try:
+            data = _yt_get("comments", params, api_key)
+        except YTError:
+            break
+        for item in data.get("items", []):
+            s = item["snippet"]
+            replies.append((s.get("authorDisplayName", ""), s.get("textOriginal", "")))
+        page_token = data.get("nextPageToken")
+        if not page_token:
+            break
+    return replies
+
+
+# ── run modes ────────────────────────────────────────────────
+
+def _run_keyword_mode(api_key, keywords, video_type, top_n, names):
+    selected: list[tuple[str, str, str]] = []  # (video_id, type, keyword)
+
+    with st.spinner("Searching YouTube…"):
+        for keyword in keywords:
+            try:
+                found_ids = _search_videos(keyword, api_key)
+            except YTError as exc:
+                _report_api_error(exc, f'searching "{keyword}"')
+                return
+            if not found_ids:
+                st.info(f'No videos found for "{keyword}".')
+                continue
+
+            try:
+                types = _classify_videos(found_ids, api_key)
+            except YTError as exc:
+                _report_api_error(exc, f'classifying videos for "{keyword}"')
+                return
+
+            wanted = [TYPE_SHORT, TYPE_LONG] if video_type == "Both" else [video_type]
+            for wtype in wanted:
+                picked = [v for v in found_ids if types.get(v) == wtype][:top_n]
+                if len(picked) < top_n:
+                    st.info(
+                        f'"{keyword}": only {len(picked)} {wtype} video(s) in the '
+                        f"top search results (asked for {top_n})."
+                    )
+                selected.extend((v, wtype, keyword) for v in picked)
+
+    if not selected:
+        st.warning("No matching videos to scan.")
+        return
+
+    _scan_videos_and_render(api_key, selected, names, include_keyword=True)
+
+
+def _run_links_mode(api_key, video_ids, names):
+    with st.spinner("Classifying videos…"):
+        try:
+            types = _classify_videos(video_ids, api_key)
+        except YTError as exc:
+            _report_api_error(exc, "classifying videos")
+            return
+    selected = [(v, types.get(v, TYPE_LONG), "") for v in video_ids]
+    _scan_videos_and_render(api_key, selected, names, include_keyword=False)
+
+
+def _video_url(video_id: str, vtype: str) -> str:
+    if vtype == TYPE_SHORT:
+        return f"https://www.youtube.com/shorts/{video_id}"
+    return f"https://www.youtube.com/watch?v={video_id}"
+
+
+def _report_api_error(exc: YTError, context: str):
+    if exc.reason in ("quotaExceeded", "dailyLimitExceeded"):
+        st.error(
+            f"YouTube API daily quota exhausted while {context}. "
+            "Quota resets at midnight Pacific time."
+        )
+    elif exc.reason in ("keyInvalid", "badRequest") or "API key" in str(exc):
+        st.error(f"YouTube API key problem while {context}: {exc}")
+    else:
+        st.error(f"YouTube API error while {context}: {exc}")
+
+
+def _scan_videos_and_render(api_key, selected, names, include_keyword: bool):
+    total = len(selected)
+    progress = st.progress(0, text=f"Scanning comments on {total} video(s)…")
+
+    rows: list[dict] = []
+    scan_notes: list[str] = []
+    scanned = 0
+
+    for done, (video_id, vtype, keyword) in enumerate(selected, start=1):
+        url = _video_url(video_id, vtype)
+        try:
+            comments = _fetch_all_comments(video_id, api_key)
+            scanned += 1
+        except YTError as exc:
+            if exc.reason == "commentsDisabled":
+                scan_notes.append(f"{url} — comments are disabled")
+            elif exc.reason in ("quotaExceeded", "dailyLimitExceeded"):
+                progress.empty()
+                _report_api_error(exc, "reading comments")
+                st.info(f"Stopped after {done - 1} of {total} video(s).")
+                break
+            else:
+                scan_notes.append(f"{url} — {exc}")
+            comments = []
+
+        for author, text in comments:
+            if _norm_name(author) in names:
+                row = {
+                    "Channel name": author,
+                    "Comment": text,
+                    "Video link": url,
+                    "Video type": vtype,
+                }
+                if include_keyword:
+                    row["Keyword"] = keyword
+                rows.append(row)
+
+        progress.progress(done / total, text=f"({done}/{total}) videos scanned")
+
+    progress.empty()
+    _render_results(rows, scanned, scan_notes, include_keyword)
+
+
+# ── results ──────────────────────────────────────────────────
+
+def _render_results(rows, scanned, scan_notes, include_keyword: bool):
+    if scan_notes:
+        with st.expander(f"⚠️ {len(scan_notes)} video(s) skipped or partial"):
+            for note in scan_notes:
+                st.markdown(f"- {note}")
+
+    if not rows:
+        st.warning(
+            f"No seeding comments found on the {scanned} scanned video(s). "
+            "Double-check the channel names match exactly how they appear on YouTube."
+        )
+        return
+
+    columns = ["Channel name", "Comment", "Video link", "Video type"]
+    if include_keyword:
+        columns.append("Keyword")
+    df = pd.DataFrame(rows, columns=columns)
+
+    by_channel = df["Channel name"].value_counts()
+    st.success(
+        f"✅ Found **{len(df)}** seeding comment(s) from "
+        f"**{len(by_channel)}** channel(s) across {scanned} scanned video(s)."
+    )
+    st.dataframe(
+        df,
+        use_container_width=True,
+        hide_index=True,
+        height=460,
+        column_config={
+            "Video link": st.column_config.LinkColumn("Video link"),
+        },
+    )
+
+    c1, c2 = st.columns(2)
+    with c1:
+        st.download_button(
+            "⬇️ Download as CSV",
+            data=df.to_csv(index=False).encode("utf-8-sig"),
+            file_name="seeding_comments.csv",
+            mime="text/csv",
+            use_container_width=True,
+        )
+    with c2:
+        txt_lines = ["\t".join(columns)]
+        for _, r in df.iterrows():
+            txt_lines.append(
+                "\t".join(str(r[c]).replace("\t", " ").replace("\n", " ") for c in columns)
+            )
+        st.download_button(
+            "⬇️ Download as TXT",
+            data="\n".join(txt_lines).encode("utf-8"),
+            file_name="seeding_comments.txt",
+            mime="text/plain",
+            use_container_width=True,
+        )
