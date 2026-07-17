@@ -69,25 +69,44 @@ def _render_quick_guide():
 7. Download the final keyword-to-topic mapping as a tab-separated text file.
 
 Use a lower threshold for broader groups and a higher threshold for tighter SERP overlap.
+
+If your Serper credits run out mid-run, the app stops immediately, groups the
+keywords already fetched, and lists the unprocessed keywords so you can copy
+them and re-run just those later — no data is wasted.
             """.strip()
         )
 
 
 # ── helpers ──────────────────────────────────────────────────
 
-def _get_serp_urls(keyword: str, api_key: str, gl: str, hl: str, device: str) -> set | None:
-    try:
-        r = requests.post(
+def _get_serp_urls(keyword: str, api_key: str, gl: str, hl: str, device: str):
+    """Returns (urls, None) on success.
+    On failure returns (None, ("stop"|"skip", message)): "stop" means every
+    later call will fail too (bad key / out of credits) — abort the loop and
+    salvage what's collected; "skip" means only this keyword failed."""
+
+    def _post():
+        return requests.post(
             "https://google.serper.dev/search",
             headers={"X-API-KEY": api_key, "Content-Type": "application/json"},
             data=json.dumps({"q": keyword, "gl": gl.lower(), "hl": hl.lower(), "device": device, "num": 5}),
             timeout=15,
         )
+
+    try:
+        r = _post()
+        if r.status_code == 429:  # rate limit — back off once and retry
+            time.sleep(2)
+            r = _post()
+            if r.status_code == 429:
+                return None, ("stop", "Serper rate/credit limit hit (HTTP 429 twice)")
+        if r.status_code in (401, 403, 402):
+            return None, ("stop", f"Serper API key rejected or out of credits (HTTP {r.status_code})")
         r.raise_for_status()
         data = r.json()
-        return {item["link"] for item in data.get("organic", [])}
-    except Exception:
-        return None
+        return {item["link"] for item in data.get("organic", [])}, None
+    except Exception as exc:
+        return None, ("skip", str(exc))
 
 
 def _run_grouping(api_key, keywords, gl, hl, device, threshold):
@@ -98,17 +117,45 @@ def _run_grouping(api_key, keywords, gl, hl, device, threshold):
     keyword_serps: dict[str, set] = {}
     total = len(keywords)
 
+    stop_reason = None
     for i, kw in enumerate(keywords):
         progress.progress((i + 1) / total, text=f"({i+1}/{total}) Fetching: {kw}")
-        urls = _get_serp_urls(kw, api_key, gl, hl, device)
+        urls, error = _get_serp_urls(kw, api_key, gl, hl, device)
         if urls is not None:
             keyword_serps[kw] = urls
             logs.append(f"✅ ({i+1}/{total}) {kw}")
+        elif error[0] == "stop":
+            # Bad key / no credits: every later call fails too. Stop hammering
+            # the API and salvage everything collected so far.
+            stop_reason = error[1]
+            logs.append(f"🛑 ({i+1}/{total}) {kw} — {stop_reason}")
+            log_area.code("\n".join(logs[-15:]))
+            break
         else:
             logs.append(f"⚠️ ({i+1}/{total}) Failed — skipping: {kw}")
         log_area.code("\n".join(logs[-15:]))
         if i < total - 1:
             time.sleep(1)
+
+    unprocessed = [kw for kw in keywords if kw not in keyword_serps]
+
+    if stop_reason:
+        st.error(
+            f"Stopped early: {stop_reason}. Grouping the "
+            f"**{len(keyword_serps)}** keyword(s) already fetched so nothing "
+            "goes to waste."
+        )
+    if unprocessed:
+        with st.expander(
+            f"⚠️ {len(unprocessed)} keyword(s) not processed — copy this list to re-run them later"
+        ):
+            st.code("\n".join(unprocessed))
+
+    if not keyword_serps:
+        progress.empty()
+        log_area.empty()
+        st.warning("No SERP data could be fetched — nothing to group.")
+        return
 
     progress.progress(1.0, text="Grouping keywords…")
 
@@ -138,7 +185,7 @@ def _run_grouping(api_key, keywords, gl, hl, device, threshold):
         return
 
     df = pd.DataFrame(rows)
-    st.success(f"✅ {total} keywords → {len(groups)} groups")
+    st.success(f"✅ {len(keyword_serps)} of {total} keywords → {len(groups)} groups")
     st.dataframe(df, use_container_width=True)
 
     st.download_button(
