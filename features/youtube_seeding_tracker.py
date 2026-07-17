@@ -39,6 +39,7 @@ DEFAULT_CHANNELS = "\n".join([
 
 TYPE_SHORT = "Short"
 TYPE_LONG = "Long Video"
+TYPE_UNKNOWN = "Unknown"
 
 RE_BRANDED = re.compile(r"true\s*profit", re.IGNORECASE)
 RE_DURATION = re.compile(r"PT(?:(\d+)H)?(?:(\d+)M)?(?:(\d+)S)?")
@@ -564,8 +565,9 @@ def _run_keyword_mode(api_key, keywords, video_type, top_n, names):
     selected: list[tuple[str, str, str]] = []  # (video_id, type, keyword)
     wanted = [TYPE_SHORT, TYPE_LONG] if video_type == "Both" else [video_type]
 
+    stop_error = None
     with st.spinner("Searching YouTube…"):
-        for keyword in keywords:
+        for kw_index, keyword in enumerate(keywords):
             # Paginate search + classify until we have top_n of each wanted type
             # (search returns 50 results per page, so top 100 needs 2-3 pages).
             found: dict[str, list[str]] = {TYPE_SHORT: [], TYPE_LONG: []}
@@ -585,21 +587,39 @@ def _run_keyword_mode(api_key, keywords, video_type, top_n, names):
                     if all(len(found[t]) >= top_n for t in wanted) or not page_token:
                         break
             except YTError as exc:
-                _report_api_error(exc, f'searching "{keyword}"')
-                return
+                # Don't discard what's already collected — salvage and move on.
+                stop_error = exc
 
-            if not any_results:
+            if any_results:
+                for wtype in wanted:
+                    picked = found[wtype][:top_n]
+                    if len(picked) < top_n and stop_error is None:
+                        st.info(
+                            f'"{keyword}": only {len(picked)} {wtype} video(s) found '
+                            f"in the top search results (asked for {top_n})."
+                        )
+                    selected.extend((v, wtype, keyword) for v in picked)
+            elif stop_error is None:
                 st.info(f'No videos found for "{keyword}".')
-                continue
 
-            for wtype in wanted:
-                picked = found[wtype][:top_n]
-                if len(picked) < top_n:
-                    st.info(
-                        f'"{keyword}": only {len(picked)} {wtype} video(s) found '
-                        f"in the top search results (asked for {top_n})."
-                    )
-                selected.extend((v, wtype, keyword) for v in picked)
+            if stop_error is not None:
+                break
+
+    if stop_error is not None:
+        _report_api_error(stop_error, f'searching "{keywords[kw_index]}"')
+        not_searched = keywords[kw_index + 1 :]
+        if selected:
+            msg = (
+                f"⚠️ Continuing with the **{len(selected)}** video(s) already "
+                "collected so nothing goes to waste."
+            )
+            if not_searched:
+                msg += " Keyword(s) not searched: " + ", ".join(
+                    f'"{k}"' for k in not_searched
+                )
+            st.warning(msg)
+        # If comment quota is also gone, the scan below stops gracefully
+        # and still renders whatever it managed to read.
 
     if not selected:
         st.warning("No matching videos to scan.")
@@ -614,9 +634,16 @@ def _run_links_mode(api_key, video_ids, names):
         try:
             types = _classify_videos(video_ids, api_key)
         except YTError as exc:
-            _report_api_error(exc, "classifying videos")
-            return
-    selected = [(v, types.get(v, TYPE_LONG), "") for v in video_ids]
+            if _is_quota_error(exc):
+                st.warning(
+                    "⚠️ Quota ran out while classifying Short vs Long — video "
+                    "types will show 'Unknown'. Trying to scan comments anyway."
+                )
+                types = {}
+            else:
+                _report_api_error(exc, "classifying videos")
+                return
+    selected = [(v, types.get(v, TYPE_UNKNOWN), "") for v in video_ids]
     _scan_videos_and_render(api_key, selected, names, include_keyword=False)
 
 
@@ -626,10 +653,17 @@ def _video_url(video_id: str, vtype: str) -> str:
     return f"https://www.youtube.com/watch?v={video_id}"
 
 
+def _is_quota_error(exc: YTError) -> bool:
+    return (
+        exc.reason in ("quotaExceeded", "dailyLimitExceeded", "rateLimitExceeded")
+        or "quota" in str(exc).lower()
+    )
+
+
 def _report_api_error(exc: YTError, context: str):
-    if exc.reason in ("quotaExceeded", "dailyLimitExceeded"):
+    if _is_quota_error(exc):
         st.error(
-            f"YouTube API daily quota exhausted while {context}. "
+            f"YouTube API quota exhausted while {context}. "
             "Quota resets at midnight Pacific time."
         )
     elif exc.reason in ("keyInvalid", "badRequest") or "API key" in str(exc):
@@ -654,10 +688,13 @@ def _scan_videos_and_render(api_key, selected, names, include_keyword: bool):
         except YTError as exc:
             if exc.reason == "commentsDisabled":
                 scan_notes.append(f"{url} — comments are disabled")
-            elif exc.reason in ("quotaExceeded", "dailyLimitExceeded"):
+            elif _is_quota_error(exc):
                 progress.empty()
                 _report_api_error(exc, "reading comments")
-                st.info(f"Stopped after {done - 1} of {total} video(s).")
+                st.info(
+                    f"Stopped after {done - 1} of {total} video(s) — showing "
+                    "everything collected up to this point."
+                )
                 break
             else:
                 scan_notes.append(f"{url} — {exc}")
