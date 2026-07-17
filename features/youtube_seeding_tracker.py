@@ -1,9 +1,11 @@
+import json
 import re
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
 import pandas as pd
 import requests
 import streamlit as st
+import streamlit.components.v1 as components
 
 API_BASE = "https://www.googleapis.com/youtube/v3"
 UA_HEADERS = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)"}
@@ -33,6 +35,7 @@ DEFAULT_CHANNELS = "\n".join([
 TYPE_SHORT = "Short"
 TYPE_LONG = "Long Video"
 
+RE_BRANDED = re.compile(r"true\s*profit", re.IGNORECASE)
 RE_DURATION = re.compile(r"PT(?:(\d+)H)?(?:(\d+)M)?(?:(\d+)S)?")
 RE_VIDEO_ID_PATTERNS = [
     re.compile(r"youtube\.com/shorts/([\w-]{11})"),
@@ -495,6 +498,7 @@ def _scan_videos_and_render(api_key, selected, names, include_keyword: bool):
                 row = {
                     "Channel name": author,
                     "Comment": text,
+                    "Branded comment": "Branded" if RE_BRANDED.search(text) else "Non-Branded",
                     "Comment date": date,
                     "Video link": url,
                     "Video type": vtype,
@@ -524,15 +528,18 @@ def _render_results(rows, scanned, scan_notes, include_keyword: bool):
         )
         return
 
-    columns = ["Channel name", "Comment", "Comment date", "Video link", "Video type"]
+    columns = ["Channel name", "Comment", "Branded comment", "Comment date",
+               "Video link", "Video type"]
     if include_keyword:
         columns.append("Keyword")
     df = pd.DataFrame(rows, columns=columns)
 
     by_channel = df["Channel name"].value_counts()
+    branded = (df["Branded comment"] == "Branded").sum()
     st.success(
         f"✅ Found **{len(df)}** seeding comment(s) from "
-        f"**{len(by_channel)}** channel(s) across {scanned} scanned video(s)."
+        f"**{len(by_channel)}** channel(s) across {scanned} scanned video(s) — "
+        f"**{branded}** Branded · **{len(df) - branded}** Non-Branded."
     )
     st.dataframe(
         df,
@@ -544,8 +551,17 @@ def _render_results(rows, scanned, scan_notes, include_keyword: bool):
         },
     )
 
-    c1, c2 = st.columns(2)
+    txt_lines = ["\t".join(columns)]
+    for _, r in df.iterrows():
+        txt_lines.append(
+            "\t".join(str(r[c]).replace("\t", " ").replace("\n", " ") for c in columns)
+        )
+    txt = "\n".join(txt_lines)
+
+    c1, c2, c3 = st.columns(3)
     with c1:
+        _copy_button(txt)
+    with c2:
         st.download_button(
             "⬇️ Download as CSV",
             data=df.to_csv(index=False).encode("utf-8-sig"),
@@ -553,16 +569,74 @@ def _render_results(rows, scanned, scan_notes, include_keyword: bool):
             mime="text/csv",
             use_container_width=True,
         )
-    with c2:
-        txt_lines = ["\t".join(columns)]
-        for _, r in df.iterrows():
-            txt_lines.append(
-                "\t".join(str(r[c]).replace("\t", " ").replace("\n", " ") for c in columns)
-            )
+    with c3:
         st.download_button(
             "⬇️ Download as TXT",
-            data="\n".join(txt_lines).encode("utf-8"),
+            data=txt.encode("utf-8"),
             file_name="seeding_comments.txt",
             mime="text/plain",
             use_container_width=True,
         )
+
+
+def _copy_button(text: str):
+    """Clipboard 'Copy all' button (tab-separated — pastes cleanly into Sheets).
+    Runs inside a component iframe, so the app-wide Ctrl+C guard doesn't apply;
+    falls back to execCommand when the async clipboard API is blocked."""
+    payload = json.dumps(text)
+    components.html(
+        f"""
+        <style>
+        .cp-btn {{
+            width: 100%;
+            height: 38px;
+            font-family: 'Google Sans','Roboto',sans-serif;
+            font-weight: 500;
+            font-size: 14px;
+            letter-spacing: .25px;
+            color: #1d2939;
+            background: #fff;
+            border: 1px solid #dadce0;
+            border-radius: 4px;
+            cursor: pointer;
+            transition: background .18s, box-shadow .18s, border-color .18s;
+        }}
+        .cp-btn:hover {{
+            background: #f8f9fa;
+            border-color: #4285F4;
+            box-shadow: 0 1px 2px rgba(60,64,67,.15);
+        }}
+        .cp-btn.copied {{ color: #0c9d61; border-color: #0c9d61; }}
+        </style>
+        <button class="cp-btn" id="cpbtn">📋 Copy all</button>
+        <script>
+        const data = {payload};
+        const btn = document.getElementById('cpbtn');
+        btn.addEventListener('click', async () => {{
+            let ok = false;
+            try {{
+                await navigator.clipboard.writeText(data);
+                ok = true;
+            }} catch (e) {{
+                try {{
+                    const ta = document.createElement('textarea');
+                    ta.value = data;
+                    ta.style.position = 'fixed';
+                    ta.style.opacity = '0';
+                    document.body.appendChild(ta);
+                    ta.focus(); ta.select();
+                    ok = document.execCommand('copy');
+                    ta.remove();
+                }} catch (e2) {{ ok = false; }}
+            }}
+            btn.textContent = ok ? '✅ Copied!' : '⚠️ Press Ctrl+C';
+            btn.classList.toggle('copied', ok);
+            setTimeout(() => {{
+                btn.textContent = '📋 Copy all';
+                btn.classList.remove('copied');
+            }}, 1600);
+        }});
+        </script>
+        """,
+        height=46,
+    )
