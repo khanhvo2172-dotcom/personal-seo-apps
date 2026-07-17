@@ -35,6 +35,7 @@ from features import (
     humanizer,
     keyword_grouping,
     settings,
+    youtube_seeding_tracker,
 )
 
 FEATURES = {
@@ -48,6 +49,7 @@ FEATURES = {
     "Keyword Combiner": cartesian_product.render,
     "Bulk Check Ahrefs DR": bulk_check_dr.render,
     "Autofill Column": autofill_column.render,
+    "YouTube Seeding Tracker": youtube_seeding_tracker.render,
 }
 
 FEATURE_ICONS = {
@@ -61,6 +63,7 @@ FEATURE_ICONS = {
     "Keyword Combiner": "🧮",
     "Bulk Check Ahrefs DR": "📈",
     "Autofill Column": "📊",
+    "YouTube Seeding Tracker": "🌱",
 }
 
 if "feature_order" not in st.session_state:
