@@ -13,8 +13,22 @@ MAX_COMMENT_PAGES = 5        # ~500 newest top-level threads per video
 MAX_FULL_REPLY_THREADS = 20  # per video: threads with >5 replies fetched in full
 SHORTS_CHECK_WORKERS = 8
 
+MAX_SEARCH_PAGES = 3         # up to 150 search results per keyword
 MODE_KEYWORDS = "🔎 Keywords"
 MODE_LINKS = "🔗 Video links"
+
+DEFAULT_CHANNELS = "\n".join([
+    "@CalebThompson-w2p",
+    "@AveryWalker-z4g",
+    "@DaisyNguyen-o4x",
+    "@DorianFinch-m2f",
+    "@EthanMiller-h3x",
+    "@HarperMartinez-r2l",
+    "@JacksonRobinson-j4g",
+    "@MasonAnderson-f7e",
+    "@SophiaGarcia-o7q",
+    "@OscarLi-w2c",
+])
 
 TYPE_SHORT = "Short"
 TYPE_LONG = "Long Video"
@@ -68,7 +82,15 @@ def render():
                     horizontal=True,
                 )
             with c2:
-                top_n = st.selectbox("Top videos per keyword", [5, 10, 15, 20], index=0)
+                top_n = int(
+                    st.number_input(
+                        "Top videos per keyword",
+                        min_value=1,
+                        max_value=100,
+                        value=5,
+                        step=5,
+                    )
+                )
         else:
             links_raw = st.text_area(
                 "YouTube video links — one per line",
@@ -82,8 +104,8 @@ def render():
 
         channels_raw = st.text_area(
             "Seeding channel names — one per line",
-            placeholder="@happyshopper88\n@ecomdiary\nLinda's Store Journey",
-            height=120,
+            value=DEFAULT_CHANNELS,
+            height=240,
             help="Paste the names exactly as they appear on the channel "
             "(with or without the leading @). Matching is case-insensitive.",
         )
@@ -131,8 +153,9 @@ Notes:
   usually recent, so this catches them. Threads with more than 5 replies are
   fetched in full (up to 20 such threads per video).
 - Shorts are detected via video duration + the `/shorts/` URL check.
-- Quota: a keyword search costs ~100 units, each video ~6 — the free daily
-  quota (10,000) comfortably covers dozens of runs per day.
+- Quota: a keyword search costs 100 units per 50 results (top 100 may use 2–3
+  pages), each video ~6 — the free daily quota (10,000) still comfortably
+  covers many runs per day.
             """.strip()
         )
 
@@ -271,23 +294,29 @@ def _classify_videos(video_ids: list[str], api_key: str) -> dict[str, str]:
     return types
 
 
-def _search_videos(keyword: str, api_key: str) -> list[str]:
-    data = _yt_get(
-        "search",
-        {"part": "id", "type": "video", "q": keyword, "maxResults": 50,
-         "order": "relevance"},
-        api_key,
-    )
-    return [
+def _search_videos_page(keyword: str, api_key: str, page_token=None):
+    params = {"part": "id", "type": "video", "q": keyword, "maxResults": 50,
+              "order": "relevance"}
+    if page_token:
+        params["pageToken"] = page_token
+    data = _yt_get("search", params, api_key)
+    ids = [
         item["id"]["videoId"]
         for item in data.get("items", [])
         if item.get("id", {}).get("videoId")
     ]
+    return ids, data.get("nextPageToken")
 
 
-def _fetch_all_comments(video_id: str, api_key: str) -> list[tuple[str, str]]:
-    """All (author, text) pairs: newest ~500 top-level threads + replies."""
-    comments: list[tuple[str, str]] = []
+def _comment_date(snippet: dict) -> str:
+    """'2026-07-15T08:30:00Z' -> '2026-07-15 08:30' (UTC)."""
+    iso = snippet.get("publishedAt", "")
+    return iso[:16].replace("T", " ") if iso else ""
+
+
+def _fetch_all_comments(video_id: str, api_key: str) -> list[tuple[str, str, str]]:
+    """All (author, text, date) triples: newest ~500 top-level threads + replies."""
+    comments: list[tuple[str, str, str]] = []
     full_reply_budget = MAX_FULL_REPLY_THREADS
     page_token = None
 
@@ -306,7 +335,8 @@ def _fetch_all_comments(video_id: str, api_key: str) -> list[tuple[str, str]]:
         for thread in data.get("items", []):
             top = thread["snippet"]["topLevelComment"]["snippet"]
             comments.append(
-                (top.get("authorDisplayName", ""), top.get("textOriginal", ""))
+                (top.get("authorDisplayName", ""), top.get("textOriginal", ""),
+                 _comment_date(top))
             )
             embedded = thread.get("replies", {}).get("comments", [])
             total_replies = thread["snippet"].get("totalReplyCount", 0)
@@ -318,7 +348,8 @@ def _fetch_all_comments(video_id: str, api_key: str) -> list[tuple[str, str]]:
                 for reply in embedded:
                     rs = reply["snippet"]
                     comments.append(
-                        (rs.get("authorDisplayName", ""), rs.get("textOriginal", ""))
+                        (rs.get("authorDisplayName", ""), rs.get("textOriginal", ""),
+                         _comment_date(rs))
                     )
 
         page_token = data.get("nextPageToken")
@@ -327,8 +358,8 @@ def _fetch_all_comments(video_id: str, api_key: str) -> list[tuple[str, str]]:
     return comments
 
 
-def _fetch_thread_replies(thread_id: str, api_key: str) -> list[tuple[str, str]]:
-    replies: list[tuple[str, str]] = []
+def _fetch_thread_replies(thread_id: str, api_key: str) -> list[tuple[str, str, str]]:
+    replies: list[tuple[str, str, str]] = []
     page_token = None
     for _ in range(2):  # up to 200 replies per thread
         params = {
@@ -345,7 +376,10 @@ def _fetch_thread_replies(thread_id: str, api_key: str) -> list[tuple[str, str]]
             break
         for item in data.get("items", []):
             s = item["snippet"]
-            replies.append((s.get("authorDisplayName", ""), s.get("textOriginal", "")))
+            replies.append(
+                (s.get("authorDisplayName", ""), s.get("textOriginal", ""),
+                 _comment_date(s))
+            )
         page_token = data.get("nextPageToken")
         if not page_token:
             break
@@ -356,31 +390,42 @@ def _fetch_thread_replies(thread_id: str, api_key: str) -> list[tuple[str, str]]
 
 def _run_keyword_mode(api_key, keywords, video_type, top_n, names):
     selected: list[tuple[str, str, str]] = []  # (video_id, type, keyword)
+    wanted = [TYPE_SHORT, TYPE_LONG] if video_type == "Both" else [video_type]
 
     with st.spinner("Searching YouTube…"):
         for keyword in keywords:
+            # Paginate search + classify until we have top_n of each wanted type
+            # (search returns 50 results per page, so top 100 needs 2-3 pages).
+            found: dict[str, list[str]] = {TYPE_SHORT: [], TYPE_LONG: []}
+            page_token = None
+            any_results = False
             try:
-                found_ids = _search_videos(keyword, api_key)
+                for page in range(MAX_SEARCH_PAGES):
+                    ids, page_token = _search_videos_page(keyword, api_key, page_token)
+                    if not ids:
+                        break
+                    any_results = True
+                    types = _classify_videos(ids, api_key)
+                    for vid in ids:
+                        vtype = types.get(vid, TYPE_LONG)
+                        if vid not in found[vtype]:
+                            found[vtype].append(vid)
+                    if all(len(found[t]) >= top_n for t in wanted) or not page_token:
+                        break
             except YTError as exc:
                 _report_api_error(exc, f'searching "{keyword}"')
                 return
-            if not found_ids:
+
+            if not any_results:
                 st.info(f'No videos found for "{keyword}".')
                 continue
 
-            try:
-                types = _classify_videos(found_ids, api_key)
-            except YTError as exc:
-                _report_api_error(exc, f'classifying videos for "{keyword}"')
-                return
-
-            wanted = [TYPE_SHORT, TYPE_LONG] if video_type == "Both" else [video_type]
             for wtype in wanted:
-                picked = [v for v in found_ids if types.get(v) == wtype][:top_n]
+                picked = found[wtype][:top_n]
                 if len(picked) < top_n:
                     st.info(
-                        f'"{keyword}": only {len(picked)} {wtype} video(s) in the '
-                        f"top search results (asked for {top_n})."
+                        f'"{keyword}": only {len(picked)} {wtype} video(s) found '
+                        f"in the top search results (asked for {top_n})."
                     )
                 selected.extend((v, wtype, keyword) for v in picked)
 
@@ -445,11 +490,12 @@ def _scan_videos_and_render(api_key, selected, names, include_keyword: bool):
                 scan_notes.append(f"{url} — {exc}")
             comments = []
 
-        for author, text in comments:
+        for author, text, date in comments:
             if _norm_name(author) in names:
                 row = {
                     "Channel name": author,
                     "Comment": text,
+                    "Comment date": date,
                     "Video link": url,
                     "Video type": vtype,
                 }
@@ -478,7 +524,7 @@ def _render_results(rows, scanned, scan_notes, include_keyword: bool):
         )
         return
 
-    columns = ["Channel name", "Comment", "Video link", "Video type"]
+    columns = ["Channel name", "Comment", "Comment date", "Video link", "Video type"]
     if include_keyword:
         columns.append("Keyword")
     df = pd.DataFrame(rows, columns=columns)
