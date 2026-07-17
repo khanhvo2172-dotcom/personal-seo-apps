@@ -1,6 +1,7 @@
 import json
 import re
 from concurrent.futures import ThreadPoolExecutor, as_completed
+from datetime import datetime, timedelta, timezone
 
 import pandas as pd
 import requests
@@ -18,6 +19,10 @@ SHORTS_CHECK_WORKERS = 8
 MAX_SEARCH_PAGES = 3         # up to 150 search results per keyword
 MODE_KEYWORDS = "🔎 Keywords"
 MODE_LINKS = "🔗 Video links"
+MODE_CHECK = "🗑️ Check deletions"
+
+DAILY_QUOTA = 10_000
+QUOTA_COSTS = {"search": 100, "videos": 1, "commentThreads": 1, "comments": 1}
 
 DEFAULT_CHANNELS = "\n".join([
     "@CalebThompson-w2p",
@@ -60,7 +65,7 @@ def render():
 
     mode = st.radio(
         "Input mode",
-        [MODE_KEYWORDS, MODE_LINKS],
+        [MODE_KEYWORDS, MODE_LINKS, MODE_CHECK],
         horizontal=True,
         key="yst_mode",
     )
@@ -70,8 +75,21 @@ def render():
         links_raw = ""
         video_type = "Both"
         top_n = 5
+        uploaded_csv = None
 
-        if mode == MODE_KEYWORDS:
+        if mode == MODE_CHECK:
+            st.markdown(
+                "Upload a **CSV exported by this tool** from a previous run. "
+                "Each comment is re-checked by its Comment ID and marked "
+                "**Live** or **Deleted / hidden**."
+            )
+            uploaded_csv = st.file_uploader(
+                "Previous results CSV",
+                type=["csv"],
+                help="Use the '⬇️ Download as CSV' file from an earlier scan. "
+                "It must contain the 'Comment ID' column.",
+            )
+        elif mode == MODE_KEYWORDS:
             keywords_raw = st.text_area(
                 "Keywords — one per line",
                 placeholder="profit tracking app\nshopify profit calculator",
@@ -105,17 +123,30 @@ def render():
                 height=140,
             )
 
-        channels_raw = st.text_area(
-            "Seeding channel names — one per line",
-            value=DEFAULT_CHANNELS,
-            height=240,
-            help="Paste the names exactly as they appear on the channel "
-            "(with or without the leading @). Matching is case-insensitive.",
-        )
+        channels_raw = ""
+        if mode != MODE_CHECK:
+            channels_raw = st.text_area(
+                "Seeding channel names — one per line",
+                value=DEFAULT_CHANNELS,
+                height=240,
+                help="Paste the names exactly as they appear on the channel "
+                "(with or without the leading @). Matching is case-insensitive.",
+            )
 
-        submitted = st.form_submit_button("🌱 Find seeding comments", type="primary")
+        submit_label = (
+            "🗑️ Check for deletions" if mode == MODE_CHECK
+            else "🌱 Find seeding comments"
+        )
+        submitted = st.form_submit_button(submit_label, type="primary")
 
     if not submitted:
+        return
+
+    if mode == MODE_CHECK:
+        if uploaded_csv is None:
+            st.error("Please upload a results CSV from a previous run.")
+            return
+        _run_deletion_check(api_key, uploaded_csv)
         return
 
     names = _parse_channel_names(channels_raw)
@@ -146,6 +177,10 @@ videos per keyword. The tool searches YouTube (relevance order), classifies each
 result as Short or Long, then scans the selected videos' comments.
 
 **Video links mode** — paste specific video URLs; only those videos are scanned.
+
+**Check deletions mode** — upload a CSV exported by this tool; every comment is
+re-checked by its Comment ID and marked 🟢 Live or 🔴 Deleted / hidden (YouTube
+can't distinguish deleted vs. spam-filtered vs. held-for-review — all appear gone).
 
 In both modes, only comments whose **author name matches your seeding channel
 list** are returned (top-level comments **and** replies).
@@ -220,6 +255,50 @@ class YTError(Exception):
         self.reason = reason
 
 
+# ── quota tracking (estimate) ────────────────────────────────
+
+def _pacific_date() -> str:
+    """YouTube quota resets at midnight Pacific time."""
+    try:
+        from zoneinfo import ZoneInfo
+        return datetime.now(ZoneInfo("America/Los_Angeles")).strftime("%Y-%m-%d")
+    except Exception:
+        return (datetime.now(timezone.utc) - timedelta(hours=7)).strftime("%Y-%m-%d")
+
+
+@st.cache_resource
+def _quota_ledger() -> dict:
+    """Best-effort daily counter shared across sessions; resets when the
+    app restarts (Streamlit Cloud has no persistent storage)."""
+    return {"date": "", "units": 0}
+
+
+def _add_quota(endpoint: str):
+    cost = QUOTA_COSTS.get(endpoint, 1)
+    st.session_state["yst_run_units"] = st.session_state.get("yst_run_units", 0) + cost
+    ledger = _quota_ledger()
+    today = _pacific_date()
+    if ledger["date"] != today:
+        ledger["date"] = today
+        ledger["units"] = 0
+    ledger["units"] += cost
+
+
+def _reset_run_quota():
+    st.session_state["yst_run_units"] = 0
+
+
+def _render_quota_note():
+    run = st.session_state.get("yst_run_units", 0)
+    ledger = _quota_ledger()
+    st.caption(
+        f"📊 API quota used: **~{run:,} units** this run · "
+        f"~{ledger['units']:,} / {DAILY_QUOTA:,} today (estimate — resets at "
+        f"midnight Pacific time and when the app restarts; exact usage: "
+        f"[Google Cloud Console](https://console.cloud.google.com/apis/api/youtube.googleapis.com/quotas))"
+    )
+
+
 def _yt_get(endpoint: str, params: dict, api_key: str) -> dict:
     resp = requests.get(
         f"{API_BASE}/{endpoint}",
@@ -227,6 +306,7 @@ def _yt_get(endpoint: str, params: dict, api_key: str) -> dict:
         timeout=REQUEST_TIMEOUT,
     )
     if resp.status_code == 200:
+        _add_quota(endpoint)
         return resp.json()
 
     reason, message = "", f"HTTP {resp.status_code}"
@@ -317,9 +397,9 @@ def _comment_date(snippet: dict) -> str:
     return iso[:16].replace("T", " ") if iso else ""
 
 
-def _fetch_all_comments(video_id: str, api_key: str) -> list[tuple[str, str, str]]:
-    """All (author, text, date) triples: newest ~500 top-level threads + replies."""
-    comments: list[tuple[str, str, str]] = []
+def _fetch_all_comments(video_id: str, api_key: str) -> list[tuple[str, str, str, str]]:
+    """(author, text, date, comment_id) — newest ~500 top-level threads + replies."""
+    comments: list[tuple[str, str, str, str]] = []
     full_reply_budget = MAX_FULL_REPLY_THREADS
     page_token = None
 
@@ -336,10 +416,11 @@ def _fetch_all_comments(video_id: str, api_key: str) -> list[tuple[str, str, str
         data = _yt_get("commentThreads", params, api_key)
 
         for thread in data.get("items", []):
-            top = thread["snippet"]["topLevelComment"]["snippet"]
+            top_comment = thread["snippet"]["topLevelComment"]
+            top = top_comment["snippet"]
             comments.append(
                 (top.get("authorDisplayName", ""), top.get("textOriginal", ""),
-                 _comment_date(top))
+                 _comment_date(top), top_comment.get("id", ""))
             )
             embedded = thread.get("replies", {}).get("comments", [])
             total_replies = thread["snippet"].get("totalReplyCount", 0)
@@ -352,7 +433,7 @@ def _fetch_all_comments(video_id: str, api_key: str) -> list[tuple[str, str, str
                     rs = reply["snippet"]
                     comments.append(
                         (rs.get("authorDisplayName", ""), rs.get("textOriginal", ""),
-                         _comment_date(rs))
+                         _comment_date(rs), reply.get("id", ""))
                     )
 
         page_token = data.get("nextPageToken")
@@ -361,8 +442,8 @@ def _fetch_all_comments(video_id: str, api_key: str) -> list[tuple[str, str, str
     return comments
 
 
-def _fetch_thread_replies(thread_id: str, api_key: str) -> list[tuple[str, str, str]]:
-    replies: list[tuple[str, str, str]] = []
+def _fetch_thread_replies(thread_id: str, api_key: str) -> list[tuple[str, str, str, str]]:
+    replies: list[tuple[str, str, str, str]] = []
     page_token = None
     for _ in range(2):  # up to 200 replies per thread
         params = {
@@ -381,7 +462,7 @@ def _fetch_thread_replies(thread_id: str, api_key: str) -> list[tuple[str, str, 
             s = item["snippet"]
             replies.append(
                 (s.get("authorDisplayName", ""), s.get("textOriginal", ""),
-                 _comment_date(s))
+                 _comment_date(s), item.get("id", ""))
             )
         page_token = data.get("nextPageToken")
         if not page_token:
@@ -391,7 +472,104 @@ def _fetch_thread_replies(thread_id: str, api_key: str) -> list[tuple[str, str, 
 
 # ── run modes ────────────────────────────────────────────────
 
+def _run_deletion_check(api_key, uploaded_csv):
+    _reset_run_quota()
+    try:
+        df = pd.read_csv(uploaded_csv, dtype=str).fillna("")
+    except Exception as exc:
+        st.error(f"Could not read the CSV: {exc}")
+        return
+
+    if "Comment ID" not in df.columns:
+        st.error(
+            "This CSV has no **Comment ID** column. It was probably exported "
+            "before deletion-checking existed — re-run a scan first, then use "
+            "that new CSV here."
+        )
+        return
+
+    ids = [i.strip() for i in df["Comment ID"].tolist()]
+    unique_ids = sorted({i for i in ids if i})
+    if not unique_ids:
+        st.error("No comment IDs found in the CSV.")
+        return
+
+    live_ids: set[str] = set()
+    with st.spinner(f"Re-checking {len(unique_ids)} comment(s)…"):
+        try:
+            for i in range(0, len(unique_ids), 50):
+                chunk = unique_ids[i : i + 50]
+                data = _yt_get(
+                    "comments",
+                    {"part": "id", "id": ",".join(chunk)},
+                    api_key,
+                )
+                live_ids.update(item["id"] for item in data.get("items", []))
+        except YTError as exc:
+            _report_api_error(exc, "re-checking comments")
+            return
+
+    df["Status"] = [
+        ("🟢 Live" if i.strip() in live_ids else "🔴 Deleted / hidden") if i.strip()
+        else "⚪ No ID"
+        for i in ids
+    ]
+
+    deleted = int((df["Status"] == "🔴 Deleted / hidden").sum())
+    live = int((df["Status"] == "🟢 Live").sum())
+    if deleted:
+        st.error(
+            f"🔴 **{deleted}** of {len(df)} comment(s) are gone "
+            f"(deleted, hidden, or held for review) · 🟢 {live} still live."
+        )
+    else:
+        st.success(f"🟢 All {live} comment(s) are still live.")
+
+    # Deleted rows first so losses are immediately visible.
+    df = df.sort_values("Status", key=lambda s: s != "🔴 Deleted / hidden")
+    columns = ["Status"] + [c for c in df.columns if c != "Status"]
+    df = df[columns]
+
+    st.dataframe(
+        df,
+        use_container_width=True,
+        hide_index=True,
+        height=460,
+        column_config={"Video link": st.column_config.LinkColumn("Video link")}
+        if "Video link" in df.columns else None,
+    )
+
+    txt_lines = ["\t".join(columns)]
+    for _, r in df.iterrows():
+        txt_lines.append(
+            "\t".join(str(r[c]).replace("\t", " ").replace("\n", " ") for c in columns)
+        )
+    txt = "\n".join(txt_lines)
+
+    c1, c2, c3 = st.columns(3)
+    with c1:
+        _copy_button(txt)
+    with c2:
+        st.download_button(
+            "⬇️ Download as CSV",
+            data=df.to_csv(index=False).encode("utf-8-sig"),
+            file_name="seeding_comments_deletion_check.csv",
+            mime="text/csv",
+            use_container_width=True,
+        )
+    with c3:
+        st.download_button(
+            "⬇️ Download as TXT",
+            data=txt.encode("utf-8"),
+            file_name="seeding_comments_deletion_check.txt",
+            mime="text/plain",
+            use_container_width=True,
+        )
+    _render_quota_note()
+
+
 def _run_keyword_mode(api_key, keywords, video_type, top_n, names):
+    _reset_run_quota()
     selected: list[tuple[str, str, str]] = []  # (video_id, type, keyword)
     wanted = [TYPE_SHORT, TYPE_LONG] if video_type == "Both" else [video_type]
 
@@ -440,6 +618,7 @@ def _run_keyword_mode(api_key, keywords, video_type, top_n, names):
 
 
 def _run_links_mode(api_key, video_ids, names):
+    _reset_run_quota()
     with st.spinner("Classifying videos…"):
         try:
             types = _classify_videos(video_ids, api_key)
@@ -493,7 +672,7 @@ def _scan_videos_and_render(api_key, selected, names, include_keyword: bool):
                 scan_notes.append(f"{url} — {exc}")
             comments = []
 
-        for author, text, date in comments:
+        for author, text, date, comment_id in comments:
             if _norm_name(author) in names:
                 row = {
                     "Channel name": author,
@@ -502,6 +681,7 @@ def _scan_videos_and_render(api_key, selected, names, include_keyword: bool):
                     "Comment date": date,
                     "Video link": url,
                     "Video type": vtype,
+                    "Comment ID": comment_id,
                 }
                 if include_keyword:
                     row["Keyword"] = keyword
@@ -526,12 +706,14 @@ def _render_results(rows, scanned, scan_notes, include_keyword: bool):
             f"No seeding comments found on the {scanned} scanned video(s). "
             "Double-check the channel names match exactly how they appear on YouTube."
         )
+        _render_quota_note()
         return
 
     columns = ["Channel name", "Comment", "Branded comment", "Comment date",
                "Video link", "Video type"]
     if include_keyword:
         columns.append("Keyword")
+    columns.append("Comment ID")  # keeps exports usable by "Check deletions" mode
     df = pd.DataFrame(rows, columns=columns)
 
     by_channel = df["Channel name"].value_counts()
@@ -577,6 +759,7 @@ def _render_results(rows, scanned, scan_notes, include_keyword: bool):
             mime="text/plain",
             use_container_width=True,
         )
+    _render_quota_note()
 
 
 def _copy_button(text: str):
