@@ -10,9 +10,11 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 from urllib.parse import urlsplit, urlunsplit, unquote, urlparse, parse_qs, urljoin
 from bs4 import BeautifulSoup, NavigableString, Tag
 from features.auth import get_credentials, require_auth
+from features.bulk_check_dr import _fetch_dr as _fetch_domain_dr
 
 STATUS_CHECK_TIMEOUT = 8
 STATUS_CHECK_WORKERS = 10
+DR_CHECK_WORKERS = 8
 CLAUDE_DEFAULT_MODEL = "claude-sonnet-4-20250514"
 
 BLOG_FETCH_TIMEOUT = 20
@@ -551,6 +553,9 @@ def _analyze_links(raw: list, urls_input: str, ml_input: str, check_ml: bool, do
     with st.spinner("Checking URL status codes..."):
         status_codes = _check_status_codes(status_urls)
 
+    with st.spinner("Checking external domain DR (Ahrefs)…"):
+        dr_by_url = _dr_column_map([u for u, _ in unique])
+
     ml_slugs = _parse_ml_slugs(ml_input) if check_ml else set()
     ml_links = _find_ml_links(normalized, ml_slugs) if check_ml else []
     english_ml_links = _find_english_ml_links(normalized, ml_slugs) if check_ml else []
@@ -558,6 +563,7 @@ def _analyze_links(raw: list, urls_input: str, ml_input: str, check_ml: bool, do
     return {
         "mode": "single",
         "unique": [(u, a, status_codes.get(u, "N/A")) for u, a in unique],
+        "dr_by_url": dr_by_url,
         "target_count": len(target_urls),
         "missing": [
             (u, target_url_titles.get(u, ""), status_codes.get(u, "N/A"))
@@ -650,6 +656,9 @@ def _run_check_multi(blog_urls: list[str], ml_input: str):
     with st.spinner("Checking URL status codes..."):
         status_codes = _check_status_codes(status_urls)
 
+    with st.spinner("Checking external domain DR (Ahrefs)…"):
+        dr_by_url = _dr_column_map([u for u, _ in unique])
+
     # "Multilingual links found" lists every ES/DE/FR link across all pages
     # (not slug-filtered) so the user sees which localized links are in use.
     ml_links = _find_ml_links(all_normalized, set())
@@ -659,6 +668,7 @@ def _run_check_multi(blog_urls: list[str], ml_input: str):
         "input_count": len(blog_urls),
         "had_ml_slugs": bool(ml_slugs),
         "unique": [(u, a, status_codes.get(u, "N/A")) for u, a in unique],
+        "dr_by_url": dr_by_url,
         "multilingual_links": ml_links,
         "english_ml_links_multi": still_english_rows,
         "fetch_errors": fetch_errors,
@@ -679,6 +689,8 @@ def _render_results(results: dict):
     pd.set_option("display.max_colwidth", None)
     df_found = pd.DataFrame(unique, columns=["\U0001f517 Link", "\U0001f4ac Anchor Text", "Status Code"])
     df_found.insert(0, "#", range(1, len(df_found) + 1))
+    dr_by_url = results.get("dr_by_url", {})
+    df_found["DR (Ahrefs)"] = [dr_by_url.get(u, "—") for u, _, _ in unique]
     df_found = _filter_dataframe(
         df_found,
         _render_filter(
@@ -692,6 +704,10 @@ def _render_results(results: dict):
         "check_links_table_found",
         "All links",
         copy_column="\U0001f517 Link",
+    )
+    st.caption(
+        "DR = Domain Rating by Ahrefs — checked for external domains only "
+        "(internal trueprofit.io links show —)."
     )
 
     col1, col2 = st.columns(2)
@@ -826,6 +842,8 @@ def _render_results_multi(results: dict):
     st.subheader("✅ All Links Found (all pages)")
     df_found = pd.DataFrame(unique, columns=["\U0001f517 Link", "\U0001f4ac Anchor Text", "Status Code"])
     df_found.insert(0, "#", range(1, len(df_found) + 1))
+    dr_by_url = results.get("dr_by_url", {})
+    df_found["DR (Ahrefs)"] = [dr_by_url.get(u, "—") for u, _, _ in unique]
     df_found = _filter_dataframe(
         df_found,
         _render_filter(
@@ -839,6 +857,11 @@ def _render_results_multi(results: dict):
         "check_links_multi_table_found",
         "All links",
         copy_column="\U0001f517 Link",
+    )
+
+    st.caption(
+        "DR = Domain Rating by Ahrefs — checked for external domains only "
+        "(internal trueprofit.io links show —)."
     )
 
     st.subheader("🌐 Multilingual Links Found (all pages)")
@@ -1032,6 +1055,69 @@ def _filter_dataframe(df: pd.DataFrame, query: str) -> pd.DataFrame:
     return df[matches]
 
 
+
+
+def _domain_of(url: str) -> str:
+    """Host of a URL, lowercased, without userinfo or port."""
+    try:
+        netloc = urlsplit(url).netloc.lower()
+    except Exception:
+        return ""
+    if "@" in netloc:
+        netloc = netloc.rsplit("@", 1)[-1]
+    return netloc.split(":")[0]
+
+
+def _is_internal_host(host: str) -> bool:
+    return host == "trueprofit.io" or host.endswith(".trueprofit.io")
+
+
+def _root_domain(host: str) -> str:
+    """Strip a leading www. so DR is checked at the domain level."""
+    return host[4:] if host.startswith("www.") else host
+
+
+def _dr_column_map(urls: list[str]) -> dict[str, str]:
+    """Map each link URL -> a DR display string for the results table.
+
+    External domains are looked up on Ahrefs' free Domain Rating endpoint
+    (the same method as the \"Bulk Check Ahrefs DR\" feature); each unique
+    domain is fetched once. Internal trueprofit.io links and non-web links
+    show \"—\". A domain whose lookup fails (rate-limited / invalid) shows
+    \"n/a\" while every other domain is still returned, so one failure never
+    discards the rest.
+    """
+    domain_by_url: dict[str, str | None] = {}
+    to_fetch: set[str] = set()
+    for u in urls:
+        host = _domain_of(u)
+        if not host or _is_internal_host(host):
+            domain_by_url[u] = None
+        else:
+            root = _root_domain(host)
+            domain_by_url[u] = root
+            to_fetch.add(root)
+
+    dr_by_domain: dict[str, object] = {}
+    if to_fetch:
+        with ThreadPoolExecutor(max_workers=DR_CHECK_WORKERS) as executor:
+            futures = {executor.submit(_fetch_domain_dr, d): d for d in to_fetch}
+            for future in as_completed(futures):
+                domain = futures[future]
+                try:
+                    res = future.result()
+                    dr_by_domain[domain] = res.get("DR") if res.get("Status") == "OK" else None
+                except Exception:
+                    dr_by_domain[domain] = None
+
+    out: dict[str, str] = {}
+    for u, domain in domain_by_url.items():
+        if domain is None:
+            out[u] = "—"
+        else:
+            dr = dr_by_domain.get(domain)
+            out[u] = str(int(round(dr))) if dr is not None else "n/a"
+    return out
 
 
 def _check_status_codes(urls: list[str]) -> dict[str, str]:
