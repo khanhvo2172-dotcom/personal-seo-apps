@@ -89,7 +89,7 @@ def _normalize_target(item: str) -> str:
     return netloc
 
 
-def _collect_targets(text: str, uploaded) -> list[str]:
+def _collect_targets(text: str, uploaded) -> list[tuple[str, str]]:
     raw: list[str] = []
 
     if text:
@@ -110,13 +110,15 @@ def _collect_targets(text: str, uploaded) -> list[str]:
             st.warning(f"Could not read uploaded file: {exc}")
 
     # Normalize to a root domain, drop blanks, dedupe while preserving order.
+    # Each kept entry is (original input, normalized domain).
     seen: set[str] = set()
-    targets: list[str] = []
+    targets: list[tuple[str, str]] = []
     for item in raw:
+        original = item.strip()
         domain = _normalize_target(item)
         if domain and domain not in seen:
             seen.add(domain)
-            targets.append(domain)
+            targets.append((original, domain))
     return targets
 
 
@@ -149,24 +151,30 @@ def _fetch_dr(target: str) -> dict:
         return {"Target": target, "DR": None, "Status": "Request failed"}
 
 
-def _run_bulk_check(targets: list[str]):
+def _run_bulk_check(targets: list[tuple[str, str]]):
     total = len(targets)
     progress = st.progress(0, text=f"Checking {total} target(s)…")
     results: list[dict] = []
 
+    domains = [domain for _, domain in targets]
+    input_by_domain = {domain: original for original, domain in targets}
+
     with ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
-        futures = {executor.submit(_fetch_dr, t): t for t in targets}
+        futures = {executor.submit(_fetch_dr, d): d for d in domains}
         for done, future in enumerate(as_completed(futures), start=1):
             results.append(future.result())
             progress.progress(done / total, text=f"({done}/{total}) checked")
 
     progress.empty()
 
-    # Preserve the user's original input order.
-    order = {t: i for i, t in enumerate(targets)}
+    # Preserve the user's original input order and re-attach the original text.
+    order = {domain: i for i, domain in enumerate(domains)}
     results.sort(key=lambda r: order.get(r["Target"], 0))
+    for r in results:
+        r["Input"] = input_by_domain.get(r["Target"], r["Target"])
 
-    df = pd.DataFrame(results, columns=["Target", "DR", "Status"])
+    df = pd.DataFrame(results, columns=["Input", "Target", "DR", "Status"])
+    df = df.rename(columns={"Target": "Domain"})
     ok = (df["Status"] == "OK").sum()
     failed = total - ok
 
@@ -216,10 +224,12 @@ def _status_badge(status: str) -> str:
 def _render_results_table(df: pd.DataFrame):
     rows = []
     for _, r in df.iterrows():
-        target = _html.escape(str(r["Target"]))
+        original = _html.escape(str(r["Input"]))
+        domain = _html.escape(str(r["Domain"]))
         rows.append(
             f'<tr>'
-            f'<td class="t-target">{target}</td>'
+            f'<td class="t-target">{original}</td>'
+            f'<td class="t-domain">{domain}</td>'
             f'<td class="t-center">{_dr_badge(r["DR"])}</td>'
             f'<td class="t-center">{_status_badge(str(r["Status"]))}</td>'
             f'</tr>'
@@ -271,6 +281,7 @@ def _render_results_table(df: pd.DataFrame):
         table.ahrefs-dr tbody tr:last-child td {{ border-bottom: none; }}
         table.ahrefs-dr tbody tr:hover {{ background: #f9fafb; }}
         .ahrefs-dr .t-target {{ font-weight: 500; color: #101828; word-break: break-all; }}
+        .ahrefs-dr .t-domain {{ color: #667085; word-break: break-all; }}
         .ahrefs-dr .t-center {{ text-align: center; }}
         .dr-badge {{
             display: inline-flex;
@@ -317,7 +328,7 @@ def _render_results_table(df: pd.DataFrame):
           <div class="ahrefs-dr-scroll">
             <table class="ahrefs-dr">
               <thead>
-                <tr><th class="left">Target</th><th>DR</th><th>Status</th></tr>
+                <tr><th class="left">Your Input</th><th class="left">Domain Checked</th><th>DR</th><th>Status</th></tr>
               </thead>
               <tbody>{rows_html}</tbody>
             </table>
