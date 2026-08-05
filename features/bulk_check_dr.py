@@ -160,7 +160,7 @@ def _run_bulk_check(targets: list[str]):
 # ── Ahrefs-style results table ───────────────────────────────
 
 def _dr_badge(dr) -> str:
-    if dr is None:
+    if dr is None or pd.isna(dr):
         return '<span class="dr-badge dr-na">—</span>'
     if dr >= 70:
         cls = "dr-high"
