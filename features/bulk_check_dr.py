@@ -4,6 +4,7 @@ import requests
 import pandas as pd
 import streamlit as st
 from concurrent.futures import ThreadPoolExecutor, as_completed
+from urllib.parse import urlsplit
 
 API_URL = "https://api.ahrefs.com/v3/public/domain-rating-free"
 MAX_WORKERS = 8
@@ -52,7 +53,9 @@ def _render_quick_guide():
 Notes:
 - No API key needed — this uses Ahrefs' free public endpoint.
 - Domain Rating is on a 100-point logarithmic scale.
-- Duplicate targets are removed automatically.
+- Targets are normalized to their root domain (scheme, `www.`, path and
+  port are stripped), so `https://www.example.com/page` and `example.com`
+  count as one check — duplicates are removed automatically.
 - Data is **Domain Rating by Ahrefs** and subject to the
   [Domain Rating License](http://ahrefs.com/legal/domain-rating-license).
             """.strip()
@@ -60,6 +63,31 @@ Notes:
 
 
 # ── input parsing ────────────────────────────────────────────
+
+def _normalize_target(item: str) -> str:
+    """Reduce any domain/URL to a bare, lowercased root domain.
+
+    So ``https://www.Example.com/path``, ``www.example.com`` and
+    ``example.com/`` all collapse to ``example.com`` — one API call, not
+    three. Strips scheme, userinfo, port, path and a leading ``www.``.
+    """
+    cleaned = item.strip()
+    if not cleaned:
+        return ""
+    candidate = cleaned if "://" in cleaned else "//" + cleaned
+    try:
+        netloc = urlsplit(candidate).netloc.lower()
+    except Exception:
+        netloc = ""
+    if not netloc:
+        netloc = cleaned.lower()
+    if "@" in netloc:
+        netloc = netloc.rsplit("@", 1)[-1]
+    netloc = netloc.split(":")[0]
+    if netloc.startswith("www."):
+        netloc = netloc[4:]
+    return netloc
+
 
 def _collect_targets(text: str, uploaded) -> list[str]:
     raw: list[str] = []
@@ -81,14 +109,14 @@ def _collect_targets(text: str, uploaded) -> list[str]:
         except Exception as exc:
             st.warning(f"Could not read uploaded file: {exc}")
 
-    # Strip, drop blanks, dedupe while preserving order.
+    # Normalize to a root domain, drop blanks, dedupe while preserving order.
     seen: set[str] = set()
     targets: list[str] = []
     for item in raw:
-        cleaned = item.strip()
-        if cleaned and cleaned.lower() not in seen:
-            seen.add(cleaned.lower())
-            targets.append(cleaned)
+        domain = _normalize_target(item)
+        if domain and domain not in seen:
+            seen.add(domain)
+            targets.append(domain)
     return targets
 
 
