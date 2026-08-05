@@ -1,8 +1,10 @@
 import html as _html
+import json
 import time
 import requests
 import pandas as pd
 import streamlit as st
+import streamlit.components.v1 as components
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from urllib.parse import urlsplit
 
@@ -221,7 +223,46 @@ def _status_badge(status: str) -> str:
     return f'<span class="status-badge {cls}">{_html.escape(status)}</span>'
 
 
+def _render_copy_button(df: pd.DataFrame, key: str):
+    """A 'Copy table' button that copies the results as TSV (paste-ready
+    into Google Sheets / Excel). Mirrors the button used in the link checker."""
+    tsv = df.to_csv(sep="\t", index=False)
+    tsv_escaped = json.dumps(tsv)
+    btn_id = f"copy-btn-{key}"
+    components.html(
+        f"""
+        <button id="{btn_id}" style="
+            border: 1px solid #d1d5db; border-radius: 6px; background: #ffffff;
+            color: #374151; padding: 5px 12px; cursor: pointer; font-size: 13px;
+            display: inline-flex; align-items: center; gap: 5px;
+        ">
+            <svg width="14" height="14" viewBox="0 0 24 24" fill="none"
+                 stroke="currentColor" stroke-width="2" stroke-linecap="round"
+                 stroke-linejoin="round">
+                <rect x="9" y="9" width="13" height="13" rx="2"/>
+                <path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"/>
+            </svg>
+            <span>Copy table</span>
+        </button>
+        <script>
+            document.getElementById({json.dumps(btn_id)}).addEventListener("click", async function() {{
+                const data = {tsv_escaped};
+                try {{
+                    await navigator.clipboard.writeText(data);
+                    this.querySelector("span").textContent = "Copied!";
+                    setTimeout(() => this.querySelector("span").textContent = "Copy table", 1500);
+                }} catch(e) {{
+                    this.querySelector("span").textContent = "Failed";
+                }}
+            }});
+        </script>
+        """,
+        height=38,
+    )
+
+
 def _render_results_table(df: pd.DataFrame):
+    _render_copy_button(df, "bulk_check_dr")
     rows = []
     for _, r in df.iterrows():
         original = _html.escape(str(r["Input"]))
