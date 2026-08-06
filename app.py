@@ -34,6 +34,7 @@ from features import (
     format_gdocs,
     humanizer,
     keyword_grouping,
+    ranking_tracker,
     settings,
     youtube_seeding_tracker,
 )
@@ -48,6 +49,7 @@ FEATURES = {
     "Keyword Grouping": keyword_grouping.render,
     "Keyword Combiner": cartesian_product.render,
     "Bulk Check Ahrefs DR": bulk_check_dr.render,
+    "Keyword Ranking Tracker": ranking_tracker.render,
     "Autofill Column": autofill_column.render,
     "YouTube Seeding Tracker": youtube_seeding_tracker.render,
 }
@@ -62,6 +64,7 @@ FEATURE_ICONS = {
     "Keyword Grouping": "🏷️",
     "Keyword Combiner": "🧮",
     "Bulk Check Ahrefs DR": "📈",
+    "Keyword Ranking Tracker": "🎯",
     "Autofill Column": "📊",
     "YouTube Seeding Tracker": "🌱",
 }
