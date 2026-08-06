@@ -111,15 +111,33 @@ def render():
             )
 
         urls_input = ""
+        must_have_input = ""
         if source in (SOURCE_DOC, SOURCE_BLOG):
-            urls_input = st.text_area(
-                "URLs to check — one per line",
-                placeholder=(
-                    "https://www.example.com/page-1 | Page 1 title\n"
-                    "https://www.example.com/page-2"
-                ),
-                height=150,
-            )
+            urls_col, must_col = st.columns(2)
+            with urls_col:
+                urls_input = st.text_area(
+                    "URLs to check — one per line",
+                    placeholder=(
+                        "https://www.example.com/page-1 | Page 1 title\n"
+                        "https://www.example.com/page-2"
+                    ),
+                    height=150,
+                )
+            with must_col:
+                must_have_input = st.text_area(
+                    "Must-have URLs — one per line",
+                    placeholder=(
+                        "https://trueprofit.io/blog/net-profit-margin\n"
+                        "https://trueprofit.io/tools/profit-margin-calculator"
+                    ),
+                    height=150,
+                    help=(
+                        "The most important internal links that must be present. "
+                        "These are checked like the box on the left, and every row "
+                        "matching one of them is flagged '⭐ Must-have' in the "
+                        "results' Note column."
+                    ),
+                )
 
         ml_input = ""
         show_ml_box = source == SOURCE_MULTI or st.session_state.get("check_ml")
@@ -147,19 +165,19 @@ def render():
                 return
             results = _run_check_multi(blog_urls, ml_input)
         else:
-            if not urls_input.strip():
-                st.error("Please provide at least one URL to check.")
+            if not urls_input.strip() and not must_have_input.strip():
+                st.error("Please provide at least one URL to check (or a Must-have URL).")
                 return
             if source == SOURCE_DOC:
                 if not doc_url.strip():
                     st.error("Please provide a Google Doc URL.")
                     return
-                results = _run_check(doc_url.strip(), urls_input, ml_input, check_ml)
+                results = _run_check(doc_url.strip(), urls_input, ml_input, check_ml, must_have_input)
             else:
                 if not blog_url.strip():
                     st.error("Please provide a TrueProfit blog URL.")
                     return
-                results = _run_check_blog(blog_url.strip(), urls_input, ml_input, check_ml)
+                results = _run_check_blog(blog_url.strip(), urls_input, ml_input, check_ml, must_have_input)
 
         if results:
             st.session_state["check_links_results"] = results
@@ -421,7 +439,7 @@ def _find_english_ml_links(found_links: list, ml_slugs: set) -> list:
     return sorted(results, key=lambda x: x["URL"])
 
 
-def _run_check(doc_url: str, urls_input: str, ml_input: str = "", check_ml: bool = False):
+def _run_check(doc_url: str, urls_input: str, ml_input: str = "", check_ml: bool = False, must_have_input: str = ""):
     m = re.search(r"/document/d/([a-zA-Z0-9_-]+)", doc_url)
     if not m:
         st.error("Invalid Google Doc URL. Please use the full URL from your browser.")
@@ -458,10 +476,10 @@ def _run_check(doc_url: str, urls_input: str, ml_input: str = "", check_ml: bool
             _find_links(item.get("content", []), raw)
 
     doc_text = _document_text(body_content, footnotes, headers, footers)
-    return _analyze_links(raw, urls_input, ml_input, check_ml, doc_text)
+    return _analyze_links(raw, urls_input, ml_input, check_ml, doc_text, must_have_input)
 
 
-def _run_check_blog(blog_url: str, urls_input: str, ml_input: str = "", check_ml: bool = False):
+def _run_check_blog(blog_url: str, urls_input: str, ml_input: str = "", check_ml: bool = False, must_have_input: str = ""):
     """Fetch a live TrueProfit blog page and analyze its article-body links.
 
     The article body range mirrors the compare-content skill: start at the H1
@@ -491,7 +509,7 @@ def _run_check_blog(blog_url: str, urls_input: str, ml_input: str = "", check_ml
             "from the H1 to the end of the page. Results may include footer links."
         )
 
-    return _analyze_links(raw, urls_input, ml_input, check_ml, article_text)
+    return _analyze_links(raw, urls_input, ml_input, check_ml, article_text, must_have_input)
 
 
 def _has_class(target: str):
@@ -598,13 +616,21 @@ def _extract_blog_article(html: str, base_url: str) -> tuple[list, str, bool]:
     return links, " ".join(text_parts), bio is not None
 
 
-def _analyze_links(raw: list, urls_input: str, ml_input: str, check_ml: bool, doc_text: str):
+def _analyze_links(raw: list, urls_input: str, ml_input: str, check_ml: bool, doc_text: str, must_have_input: str = ""):
     """Shared analysis for both sources: compare found links against targets,
     detect duplicates, check status codes, and build the result dict."""
     normalized = [(n, a) for u, a in raw if (n := _normalize(u))]
     unique = list(dict.fromkeys(normalized))
 
     target_url_titles = _parse_target_urls(urls_input)
+    # Must-have URLs are the important internal links that must be present. Fold
+    # them into the target set so they're checked (and flagged missing) even when
+    # they aren't also listed in the left-hand box; keep the set so the results
+    # tables can mark matching rows in the Note column.
+    must_have_titles = _parse_target_urls(must_have_input)
+    must_have_urls = set(must_have_titles)
+    for url, title in must_have_titles.items():
+        target_url_titles.setdefault(url, title)
     target_urls = set(target_url_titles)
     found_url_list = [u for u, _ in normalized]
     url_counts = Counter(found_url_list)
@@ -626,6 +652,7 @@ def _analyze_links(raw: list, urls_input: str, ml_input: str, check_ml: bool, do
         "mode": "single",
         "unique": [(u, a, status_codes.get(u, "N/A")) for u, a in unique],
         "dr_by_url": dr_by_url,
+        "must_have_urls": sorted(must_have_urls),
         "target_count": len(target_urls),
         "missing": [
             (u, target_url_titles.get(u, ""), status_codes.get(u, "N/A"))
@@ -749,10 +776,12 @@ def _render_results(results: dict):
 
     st.subheader("✅ All Links Found in Document")
     pd.set_option("display.max_colwidth", None)
+    must_have = set(results.get("must_have_urls") or [])
     df_found = pd.DataFrame(unique, columns=["\U0001f517 Link", "\U0001f4ac Anchor Text", "Status Code"])
     df_found.insert(0, "#", range(1, len(df_found) + 1))
     dr_by_url = results.get("dr_by_url", {})
     df_found["DR (Ahrefs)"] = [dr_by_url.get(u, "—") for u, _, _ in unique]
+    df_found["Note"] = ["⭐ Must-have" if u in must_have else "" for u, _, _ in unique]
     df_found = _filter_dataframe(
         df_found,
         _render_filter(
@@ -778,6 +807,7 @@ def _render_results(results: dict):
         st.subheader("\U0001f6ab Missing Links")
         if missing:
             df_missing = pd.DataFrame(missing, columns=["URL", "Title", "Status Code"])
+            df_missing["Note"] = ["⭐ Must-have" if u in must_have else "" for u, _, _ in missing]
             df_missing = _filter_dataframe(
                 df_missing,
                 _render_filter(
@@ -798,8 +828,10 @@ def _render_results(results: dict):
     with col2:
         st.subheader("\U0001f501 Duplicate Links (> 1 occurrence)")
         if duplicates:
+            df_duplicates = pd.DataFrame(duplicates, columns=["URL", "Count", "Status Code"])
+            df_duplicates["Note"] = ["⭐ Must-have" if u in must_have else "" for u, _, _ in duplicates]
             df_duplicates = _filter_dataframe(
-                pd.DataFrame(duplicates, columns=["URL", "Count", "Status Code"]),
+                df_duplicates,
                 _render_filter(
                     "Filter duplicate links",
                     "check_links_filter_duplicates",
