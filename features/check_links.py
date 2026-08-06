@@ -807,7 +807,7 @@ def _render_results(results: dict):
         st.subheader("\U0001f6ab Missing Links")
         if missing:
             df_missing = pd.DataFrame(missing, columns=["URL", "Title", "Status Code"])
-            df_missing["Note"] = ["⭐ Must-have" if u in must_have else "" for u, _, _ in missing]
+            df_missing.insert(0, "Note", ["⭐ Must-have" if u in must_have else "" for u, _, _ in missing])
             df_missing = _filter_dataframe(
                 df_missing,
                 _render_filter(
