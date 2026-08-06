@@ -509,7 +509,7 @@ def _run_check_blog(blog_url: str, urls_input: str, ml_input: str = "", check_ml
             "from the H1 to the end of the page. Results may include footer links."
         )
 
-    return _analyze_links(raw, urls_input, ml_input, check_ml, article_text, must_have_input)
+    return _analyze_links(raw, urls_input, ml_input, check_ml, article_text, must_have_input, self_url=blog_url)
 
 
 def _has_class(target: str):
@@ -616,7 +616,7 @@ def _extract_blog_article(html: str, base_url: str) -> tuple[list, str, bool]:
     return links, " ".join(text_parts), bio is not None
 
 
-def _analyze_links(raw: list, urls_input: str, ml_input: str, check_ml: bool, doc_text: str, must_have_input: str = ""):
+def _analyze_links(raw: list, urls_input: str, ml_input: str, check_ml: bool, doc_text: str, must_have_input: str = "", self_url: str = ""):
     """Shared analysis for both sources: compare found links against targets,
     detect duplicates, check status codes, and build the result dict."""
     normalized = [(n, a) for u, a in raw if (n := _normalize(u))]
@@ -631,6 +631,21 @@ def _analyze_links(raw: list, urls_input: str, ml_input: str, check_ml: bool, do
     must_have_urls = set(must_have_titles)
     for url, title in must_have_titles.items():
         target_url_titles.setdefault(url, title)
+    # A page never links to itself, so drop the scanned blog URL from the
+    # targets — otherwise it shows up in Missing Links as "missing a link to
+    # itself". Match both the www and non-www forms since _normalize keeps the
+    # host as-is.
+    self_norm = _normalize(self_url)
+    if self_norm:
+        sp = urlsplit(self_norm)
+        alt_host = sp.netloc[4:] if sp.netloc.startswith("www.") else "www." + sp.netloc
+        self_variants = {
+            self_norm,
+            urlunsplit((sp.scheme, alt_host, sp.path, sp.query, sp.fragment)),
+        }
+        for variant in self_variants:
+            target_url_titles.pop(variant, None)
+            must_have_urls.discard(variant)
     target_urls = set(target_url_titles)
     found_url_list = [u for u, _ in normalized]
     url_counts = Counter(found_url_list)
