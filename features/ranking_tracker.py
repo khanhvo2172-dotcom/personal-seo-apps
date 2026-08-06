@@ -6,21 +6,39 @@ from urllib.parse import urlsplit
 import requests
 import pandas as pd
 import streamlit as st
+import streamlit.components.v1 as components
 from dotenv import load_dotenv
 
 load_dotenv()
 
-SERPER_URL = "https://google.serper.dev/search"
+SERPER_SEARCH_URL = "https://google.serper.dev/search"
+SERPER_VIDEOS_URL = "https://google.serper.dev/videos"
 SEARCHAPI_URL = "https://www.searchapi.io/api/v1/search"
 TOP_N = 5
 REQUEST_TIMEOUT = 30
+
+# Platform -> the host(s) that count as that platform.
+PLATFORMS = {
+    "Reddit": ["reddit.com"],
+    "Quora": ["quora.com"],
+    "YouTube": ["youtube.com", "youtu.be"],
+    "TikTok": ["tiktok.com"],
+    "X": ["x.com", "twitter.com"],
+    "LinkedIn": ["linkedin.com"],
+    "Facebook": ["facebook.com", "fb.com", "fb.watch"],
+}
+
+# Which platforms are checked in which surface.
+ORGANIC_PLATFORMS = ["Reddit", "Quora", "YouTube", "TikTok", "X", "LinkedIn", "Facebook"]
+VIDEO_PLATFORMS = ["YouTube", "TikTok"]
+FORUM_PLATFORMS = ["Reddit", "Quora", "X", "LinkedIn", "Facebook"]
 
 
 def render():
     st.header("Keyword Ranking Tracker")
     st.caption(
-        "Track your Google ranking for a list of keywords, and whether Reddit "
-        "and Quora appear in the Top 5 — in both organic results and the Forums tab."
+        "Track your Google ranking for a list of keywords, and whether social/video "
+        "platforms appear in the Top 5 — across organic, Videos, Short Videos and Forums."
     )
     _render_quick_guide()
 
@@ -52,8 +70,15 @@ def render():
         with col4:
             device = st.selectbox("Device", ["desktop", "mobile"], index=0)
 
+        st.markdown("**Extra tabs to check** (organic Top 5 is always checked)")
+        check_videos = st.checkbox(
+            "Videos tab (Serper) — YouTube / TikTok", value=True
+        )
+        check_shorts = st.checkbox(
+            "Short Videos tab (SearchApi) — YouTube / TikTok", value=bool(searchapi_key)
+        )
         check_forums = st.checkbox(
-            "Also check the Google Forums tab (needs SearchApi key)",
+            "Forums tab (SearchApi) — Reddit / Quora / X / LinkedIn / Facebook",
             value=bool(searchapi_key),
         )
 
@@ -79,16 +104,19 @@ def render():
         st.error("Please paste at least one keyword or upload a .txt file.")
         return
 
-    if check_forums and not searchapi_key:
+    # SearchApi-backed tabs need the SearchApi key; disable with a notice if missing.
+    if (check_shorts or check_forums) and not searchapi_key:
         st.warning(
-            "Forums-tab check is on but no **SEARCHAPI_API_KEY** was found — "
-            "skipping the Forums columns. Add the key in Streamlit Secrets to enable it."
+            "Short Videos / Forums need a **SEARCHAPI_API_KEY** (not found) — those "
+            "tabs are skipped. Add the key in Streamlit Secrets to enable them."
         )
+        check_shorts = False
         check_forums = False
 
     _run_tracking(
-        keywords, my_domain, serper_key, searchapi_key if check_forums else "",
+        keywords, my_domain, serper_key, searchapi_key,
         location.strip(), gl.strip(), hl.strip(), device,
+        check_videos, check_shorts, check_forums,
     )
 
 
@@ -96,18 +124,20 @@ def _render_quick_guide():
     with st.expander("How this works"):
         st.markdown(
             """
-1. Add your **Serper** key (`SERP_API_KEY`) in ⚙️ Settings — this powers the organic search.
-2. (Optional) Add a **SearchApi** key (`SEARCHAPI_API_KEY`) in Streamlit Secrets to also check Google's **Forums** tab.
+1. Add your **Serper** key (`SERP_API_KEY`) in ⚙️ Settings — powers organic + Videos.
+2. (Optional) Add a **SearchApi** key (`SEARCHAPI_API_KEY`) in Streamlit Secrets for the **Short Videos** and **Forums** tabs.
 3. Enter your website domain and paste keywords (one per line), or upload a `.txt` file.
-4. Click **Track Rankings**. For each keyword the app records:
-   - **Your ranking** — your site's organic position (or *Featured Snippet*, or *101+* if not in the top 100).
-   - **Reddit / Quora in Organic Top 5?** — Yes/No + the exact URLs.
-   - **Reddit / Quora in Forums Top 5?** — same check on Google's Forums tab (if enabled).
+4. Tick which extra tabs to check, then click **Track Rankings**. For each keyword:
+   - **Your ranking** — your site's organic position (or *Featured Snippet*, or *101+*).
+   - **Organic Top 5** — Reddit, Quora, YouTube, TikTok, X, LinkedIn, Facebook (Yes/No + URLs).
+   - **Videos tab** — YouTube, TikTok (Serper).
+   - **Short Videos tab** — YouTube, TikTok (SearchApi `google_shorts`).
+   - **Forums tab** — Reddit, Quora, X, LinkedIn, Facebook (SearchApi `google_forums`).
 5. Review the table and download it as CSV.
 
-**Location** is fixed per run (default: United States, desktop). If a key runs out of
-credits mid-run, the app stops the organic search, keeps every keyword already
-checked, and lists the ones it did not reach so you can re-run just those.
+If a key runs out of credits mid-run, the organic search stops and keeps everything
+already fetched; each extra tab fails independently (its cells show the reason) so one
+outage never discards the rest.
             """.strip()
         )
 
@@ -125,7 +155,7 @@ def _get_secret(key: str) -> str:
 
 
 def _domain_only(url: str) -> str:
-    """Bare, lowercased domain of a URL/host, without scheme, www or path."""
+    """Bare, lowercased host of a URL, without scheme, www, userinfo or port."""
     cleaned = (url or "").strip()
     if not cleaned:
         return ""
@@ -160,30 +190,40 @@ def _collect_keywords(text: str, uploaded) -> list[str]:
     return keywords
 
 
-# ── ranking helpers ──────────────────────────────────────────
+# ── matching helpers ─────────────────────────────────────────
 
-def _domain_in_top_n(results: list[dict], domain: str, top_n: int = TOP_N):
-    """Return ("Yes"/"No", url_lines) for a domain within the top N results."""
+def _link_matches(link: str, domains: list[str]) -> bool:
+    """True if the link's host is (a subdomain of) one of `domains`. Matching on
+    host boundaries avoids false positives like 'x.com' inside 'netflix.com'."""
+    host = _domain_only(link)
+    if not host:
+        return False
+    return any(host == d or host.endswith("." + d) for d in domains)
+
+
+def _platform_in_top_n(results: list[dict], domains: list[str], top_n: int = TOP_N):
+    """Return ("Yes"/"No", url_lines) for a platform within the top N results."""
     found = []
     for r in results:
         position = r.get("position", 101)
         link = r.get("link", "")
-        if domain in link and position <= top_n:
+        if position <= top_n and _link_matches(link, domains):
             found.append(f"#{position}: {link}")
     return ("Yes" if found else "No"), ("\n".join(found) if found else "N/A")
 
 
-def _serper_organic(keyword, api_key, location, gl, hl, device):
-    """Returns (data, None) or (None, ("stop"|"skip", message)). 'stop' means
-    every later call fails too (bad key / no credits) — abort and salvage."""
+# ── API calls ────────────────────────────────────────────────
+
+def _serper_post(url, keyword, api_key, location, gl, hl, device, num):
+    """Returns (json, None) or (None, ("stop"|"skip", message))."""
 
     def _post():
         return requests.post(
-            SERPER_URL,
+            url,
             headers={"X-API-KEY": api_key, "Content-Type": "application/json"},
             data=json.dumps({
                 "q": keyword, "location": location, "gl": gl.lower(),
-                "hl": hl.lower(), "device": device, "num": 100,
+                "hl": hl.lower(), "device": device, "num": num,
             }),
             timeout=REQUEST_TIMEOUT,
         )
@@ -203,15 +243,16 @@ def _serper_organic(keyword, api_key, location, gl, hl, device):
         return None, ("skip", str(exc))
 
 
-def _searchapi_forums(keyword, api_key, location, gl, hl, device):
-    """Returns (organic_results, None) or (None, ("stop"|"skip", message))."""
+def _searchapi_get(engine, result_field, keyword, api_key, location, gl, hl, device):
+    """Query a SearchApi engine. Returns (results_list, None) or
+    (None, ("stop"|"skip", message))."""
 
     def _get():
         return requests.get(
             SEARCHAPI_URL,
             headers={"Authorization": f"Bearer {api_key}"},
             params={
-                "engine": "google_forums", "q": keyword, "location": location,
+                "engine": engine, "q": keyword, "location": location,
                 "gl": gl.lower(), "hl": hl.lower(), "device": device,
             },
             timeout=REQUEST_TIMEOUT,
@@ -227,54 +268,74 @@ def _searchapi_forums(keyword, api_key, location, gl, hl, device):
         if r.status_code in (401, 402, 403):
             return None, ("stop", f"SearchApi key rejected or out of credits (HTTP {r.status_code})")
         r.raise_for_status()
-        return r.json().get("organic_results", []), None
+        return r.json().get(result_field, []), None
     except Exception as exc:
         return None, ("skip", str(exc))
 
 
 def _own_ranking(data: dict, my_domain: str):
-    """Extract the site's own ranking + URL from a Serper response."""
-    rank, url = "101+", "N/A"
+    """Extract the site's own ranking + URL from a Serper organic response."""
     answer_box = data.get("answerBox") or {}
     ab_link = answer_box.get("link", "")
-    if ab_link and my_domain in ab_link:
+    if ab_link and _link_matches(ab_link, [my_domain]):
         return "1 (Featured Snippet)", ab_link
-
     for r in data.get("organic", []):
         link = r.get("link", "")
-        if my_domain in link:
+        if _link_matches(link, [my_domain]):
             return r.get("position", 101), link
-    return rank, url
+    return "101+", "N/A"
 
 
 # ── main run ─────────────────────────────────────────────────
 
-COLUMNS = [
-    "Keyword", "Your Ranking", "Your URL",
-    "Reddit — Organic Top 5?", "Reddit — Organic URLs",
-    "Quora — Organic Top 5?", "Quora — Organic URLs",
-    "Reddit — Forums Top 5?", "Reddit — Forums URLs",
-    "Quora — Forums Top 5?", "Quora — Forums URLs",
-]
+def _build_columns(check_videos, check_shorts, check_forums) -> list[str]:
+    cols = ["Keyword", "Your Ranking", "Your URL"]
+    for p in ORGANIC_PLATFORMS:
+        cols += [f"{p} — Organic Top 5?", f"{p} — Organic URLs"]
+    if check_videos:
+        for p in VIDEO_PLATFORMS:
+            cols += [f"{p} — Videos Top 5?", f"{p} — Videos URLs"]
+    if check_shorts:
+        for p in VIDEO_PLATFORMS:
+            cols += [f"{p} — Short Videos Top 5?", f"{p} — Short Videos URLs"]
+    if check_forums:
+        for p in FORUM_PLATFORMS:
+            cols += [f"{p} — Forums Top 5?", f"{p} — Forums URLs"]
+    return cols
+
+
+def _fill_surface(row, results, platforms, label, note=None):
+    """Write Top-5?/URLs cells for a surface. If `note` is set the surface
+    failed — write the note into every cell instead of checking results."""
+    for p in platforms:
+        flag_col, url_col = f"{p} — {label} Top 5?", f"{p} — {label} URLs"
+        if note is not None:
+            row[flag_col], row[url_col] = "n/a", note
+        else:
+            row[flag_col], row[url_col] = _platform_in_top_n(results, PLATFORMS[p])
 
 
 def _run_tracking(keywords, my_domain, serper_key, searchapi_key,
-                  location, gl, hl, device):
+                  location, gl, hl, device,
+                  check_videos, check_shorts, check_forums):
     total = len(keywords)
+    columns = _build_columns(check_videos, check_shorts, check_forums)
     progress = st.progress(0, text="Tracking rankings…")
     log_area = st.empty()
     logs: list[str] = []
 
-    rows: list[list] = []
+    rows: list[dict] = []
     processed: set[str] = set()
     stop_reason = None
-    forums_enabled = bool(searchapi_key)
-    forums_stop_reason = None
+    # Independent per-surface disable flags so one API's outage never kills others.
+    videos_stop = shorts_stop = forums_stop = None
 
     for i, kw in enumerate(keywords, 1):
         progress.progress(i / total, text=f"({i}/{total}) {kw}")
 
-        data, error = _serper_organic(kw, serper_key, location, gl, hl, device)
+        data, error = _serper_post(
+            SERPER_SEARCH_URL, kw, serper_key, location, gl, hl, device, 100
+        )
         if error and error[0] == "stop":
             stop_reason = error[1]
             logs.append(f"🛑 ({i}/{total}) {kw} — {stop_reason}")
@@ -287,40 +348,67 @@ def _run_tracking(keywords, my_domain, serper_key, searchapi_key,
 
         organic = data.get("organic", [])
         rank, url = _own_ranking(data, my_domain)
-        reddit_o, reddit_o_urls = _domain_in_top_n(organic, "reddit.com")
-        quora_o, quora_o_urls = _domain_in_top_n(organic, "quora.com")
+        row = {"Keyword": kw, "Your Ranking": rank, "Your URL": url}
+        _fill_surface(row, organic, ORGANIC_PLATFORMS, "Organic")
 
-        # Forums tab (independent API — its failure never discards organic data)
-        if forums_enabled and not forums_stop_reason:
-            fres, ferr = _searchapi_forums(kw, searchapi_key, location, gl, hl, device)
-            if ferr and ferr[0] == "stop":
-                forums_stop_reason = ferr[1]
-                reddit_f = quora_f = "n/a"
-                reddit_f_urls = quora_f_urls = forums_stop_reason
-            elif ferr:
-                reddit_f = quora_f = "n/a"
-                reddit_f_urls = quora_f_urls = f"Error: {ferr[1][:60]}"
+        # Videos tab (Serper)
+        if check_videos:
+            if videos_stop:
+                _fill_surface(row, None, VIDEO_PLATFORMS, "Videos", note=videos_stop)
             else:
-                reddit_f, reddit_f_urls = _domain_in_top_n(fres, "reddit.com")
-                quora_f, quora_f_urls = _domain_in_top_n(fres, "quora.com")
-        elif forums_stop_reason:
-            reddit_f = quora_f = "n/a"
-            reddit_f_urls = quora_f_urls = forums_stop_reason
-        else:
-            reddit_f = quora_f = "—"
-            reddit_f_urls = quora_f_urls = "—"
+                vdata, verr = _serper_post(
+                    SERPER_VIDEOS_URL, kw, serper_key, location, gl, hl, device, 10
+                )
+                if verr and verr[0] == "stop":
+                    videos_stop = verr[1]
+                    _fill_surface(row, None, VIDEO_PLATFORMS, "Videos", note=videos_stop)
+                elif verr:
+                    _fill_surface(row, None, VIDEO_PLATFORMS, "Videos", note=f"Error: {verr[1][:50]}")
+                else:
+                    _fill_surface(row, vdata.get("videos", []), VIDEO_PLATFORMS, "Videos")
+                time.sleep(0.5)
 
-        rows.append([
-            kw, rank, url,
-            reddit_o, reddit_o_urls, quora_o, quora_o_urls,
-            reddit_f, reddit_f_urls, quora_f, quora_f_urls,
-        ])
+        # Short Videos tab (SearchApi google_shorts)
+        if check_shorts:
+            if shorts_stop:
+                _fill_surface(row, None, VIDEO_PLATFORMS, "Short Videos", note=shorts_stop)
+            else:
+                sres, serr = _searchapi_get(
+                    "google_shorts", "shorts", kw, searchapi_key, location, gl, hl, device
+                )
+                if serr and serr[0] == "stop":
+                    shorts_stop = serr[1]
+                    _fill_surface(row, None, VIDEO_PLATFORMS, "Short Videos", note=shorts_stop)
+                elif serr:
+                    _fill_surface(row, None, VIDEO_PLATFORMS, "Short Videos", note=f"Error: {serr[1][:50]}")
+                else:
+                    _fill_surface(row, sres, VIDEO_PLATFORMS, "Short Videos")
+                time.sleep(0.5)
+
+        # Forums tab (SearchApi google_forums)
+        if check_forums:
+            if forums_stop:
+                _fill_surface(row, None, FORUM_PLATFORMS, "Forums", note=forums_stop)
+            else:
+                fres, ferr = _searchapi_get(
+                    "google_forums", "organic_results", kw, searchapi_key, location, gl, hl, device
+                )
+                if ferr and ferr[0] == "stop":
+                    forums_stop = ferr[1]
+                    _fill_surface(row, None, FORUM_PLATFORMS, "Forums", note=forums_stop)
+                elif ferr:
+                    _fill_surface(row, None, FORUM_PLATFORMS, "Forums", note=f"Error: {ferr[1][:50]}")
+                else:
+                    _fill_surface(row, fres, FORUM_PLATFORMS, "Forums")
+                time.sleep(0.5)
+
+        rows.append(row)
         processed.add(kw)
         logs.append(f"✅ ({i}/{total}) {kw} — rank {rank}")
         log_area.code("\n".join(logs[-15:]))
 
         if i < total:
-            time.sleep(1.2)
+            time.sleep(1.0)
 
     progress.empty()
     log_area.empty()
@@ -332,11 +420,9 @@ def _run_tracking(keywords, my_domain, serper_key, searchapi_key,
             f"Stopped early: {stop_reason}. Showing the **{len(rows)}** keyword(s) "
             "already tracked so nothing is wasted."
         )
-    if forums_stop_reason:
-        st.warning(
-            f"Forums-tab check stopped: {forums_stop_reason}. Organic columns are "
-            "still complete; affected Forums cells show the reason."
-        )
+    for surface, reason in [("Videos", videos_stop), ("Short Videos", shorts_stop), ("Forums", forums_stop)]:
+        if reason:
+            st.warning(f"{surface} tab stopped: {reason}. Other columns are unaffected.")
     if unprocessed:
         with st.expander(
             f"⚠️ {len(unprocessed)} keyword(s) not processed — copy to re-run later"
@@ -347,7 +433,7 @@ def _run_tracking(keywords, my_domain, serper_key, searchapi_key,
         st.warning("No rankings could be fetched.")
         return
 
-    df = pd.DataFrame(rows, columns=COLUMNS)
+    df = pd.DataFrame(rows, columns=columns)
     st.success(f"✅ Tracked {len(rows)} of {total} keyword(s)")
     _render_copy_button(df, "ranking_tracker")
     st.dataframe(df, use_container_width=True, hide_index=True)
@@ -361,8 +447,6 @@ def _run_tracking(keywords, my_domain, serper_key, searchapi_key,
 
 
 def _render_copy_button(df: pd.DataFrame, key: str):
-    import streamlit.components.v1 as components
-
     tsv = df.to_csv(sep="\t", index=False)
     tsv_escaped = json.dumps(tsv)
     btn_id = f"copy-btn-{key}"
