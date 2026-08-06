@@ -26,6 +26,11 @@ BIO_MARKER_CLASS = "wrap-bio"
 # The skill defines these as site chrome, not editorial links, so they are
 # filtered out of the blog-body link extraction.
 RE_BANNER_CTA = re.compile(r"utm_campaign=in-blog-banner", re.IGNORECASE)
+# Site chrome that never holds editorial links. Skipped when harvesting the
+# trailing editorial blocks (see _extract_blog_article, Part 2).
+CHROME_TAGS = ("header", "footer", "nav")
+# The slim promo strip pinned above the header ("See what happens when…").
+TOP_BANNER_CLASS = "top-header"
 
 RE_ML_LINK = re.compile(
     r"https?://(?:www\.)?trueprofit\.io/(es|de|fr)/blog/([a-z0-9-]+)",
@@ -86,9 +91,11 @@ def render():
                 "TrueProfit's Blog URL",
                 placeholder="https://trueprofit.io/blog/gross-profit-margin",
                 help=(
-                    "Reads only the article body: from the H1 heading down to "
-                    "(but not including) the author bio, FAQ included. Nav, "
-                    "footer, related posts and auto banner CTAs are skipped."
+                    "Reads the editorial article: the body from the H1 down to "
+                    "the author bio, plus the trailing Quick Recap, highlighted "
+                    "callout boxes, 'Further Reading' lists and FAQ. Nav, footer, "
+                    "the sidebar/bottom CTAs, the author bio and auto banner CTAs "
+                    "are skipped."
                 ),
             )
         else:  # SOURCE_MULTI
@@ -172,7 +179,7 @@ def _render_quick_guide():
 **Pick a source:**
 
 - **📄 Google Doc** — authenticate with Google in **Settings**, then paste the Doc URL. Links are read from the document body, tables, headers, footers, footnotes, linked images, and rich links. If the document has multiple tabs, paste the URL with the tab selected (e.g. `?tab=t.0`) to check that specific tab.
-- **🌍 TrueProfit's Blog URL** — no Google login needed. Paste a live `trueprofit.io/blog/...` URL. The app fetches the page and reads links only from the **article body**: from the H1 heading down to (but not including) the author-bio block, with the FAQ section included. Navigation, header/footer, related-post blocks and auto-inserted banner CTAs (`utm_campaign=in-blog-banner-*`) are skipped.
+- **🌍 TrueProfit's Blog URL** — no Google login needed. Paste a live `trueprofit.io/blog/...` URL. The app fetches the page and reads links from the **editorial article**: the body from the H1 down to the author-bio block, **plus** the trailing Quick Recap, highlighted callout boxes (`content-highlight`), "Further Reading" lists and the FAQ (these are rendered after the footer, so they used to be missed). Navigation, header/footer, the sidebar and bottom CTAs, the author bio and auto-inserted banner CTAs (`utm_campaign=in-blog-banner-*`) are skipped.
 
 For a **Google Doc** or **single blog URL**: paste the internal/external URLs you expect to find (one per line, optional `|` title), click **Check Links**, then review all links found, the ones missing from the source, and duplicates. The DeepSeek / Claude 4.6 buttons suggest anchor text for missing links.
 
@@ -501,8 +508,19 @@ def _has_class(target: str):
 def _extract_blog_article(html: str, base_url: str) -> tuple[list, str, bool]:
     """Extract (links, article_text, bio_found) from a blog page's article body.
 
-    Links are returned as (absolute_url, anchor_text) pairs, in reading order,
-    for everything between the first <h1> and the author-bio block.
+    Links are returned as (absolute_url, anchor_text) pairs, in reading order.
+    Two regions are scanned:
+
+    * **Part 1 — the main article wrapper**: everything from the first <h1> down
+      to (but not including) the author-bio block. This is where the bulk of the
+      prose and its in-text links live, and stopping at the bio keeps the bottom
+      CTA banner, the right-hand sidebar CTA and the bio's own links out.
+    * **Part 2 — the trailing editorial blocks**: Next.js renders the Quick
+      Recap, the highlighted callout boxes (``content-highlight``, including the
+      ``box-flex`` "Here" variant), the "Further Reading" lists
+      (``listOfArticles``) and the FAQ as body-level siblings that come *after*
+      the article wrapper and the footer, so the Part-1 walk never reaches them.
+      We harvest those siblings directly, skipping site chrome.
     """
     soup = BeautifulSoup(html, "html.parser")
     for tag in soup(["script", "style", "noscript", "template"]):
@@ -514,24 +532,68 @@ def _extract_blog_article(html: str, base_url: str) -> tuple[list, str, bool]:
 
     links: list[tuple[str, str]] = []
     text_parts: list[str] = []
+    seen_anchors: set[int] = set()
+
+    def _add_anchor(a: Tag):
+        # De-dupe on element identity so an <a> is never counted twice; distinct
+        # <a> tags pointing at the same URL are kept (that feeds duplicate
+        # detection downstream).
+        if id(a) in seen_anchors:
+            return
+        href = (a.get("href") or "").strip()
+        if not href or href.startswith(("#", "javascript:", "mailto:", "tel:")):
+            return
+        if RE_BANNER_CTA.search(href):
+            return
+        seen_anchors.add(id(a))
+        anchor = a.get_text(" ", strip=True)
+        if not anchor and a.find("img"):
+            anchor = "embedded in image"
+        links.append((urljoin(base_url, href), anchor))
+
+    # ── Part 1: main article body — H1 down to the author bio (or the end of
+    # the page when the bio marker is absent). ──────────────────────────────
     for el in start.next_elements:
         if bio is not None and el is bio:
             break
         if isinstance(el, Tag) and el.name == "a":
-            href = (el.get("href") or "").strip()
-            if not href or href.startswith(("#", "javascript:", "mailto:", "tel:")):
-                continue
-            if RE_BANNER_CTA.search(href):
-                continue
-            full = urljoin(base_url, href)
-            anchor = el.get_text(" ", strip=True)
-            if not anchor and el.find("img"):
-                anchor = "embedded in image"
-            links.append((full, anchor))
+            _add_anchor(el)
         elif isinstance(el, NavigableString):
             chunk = str(el).strip()
             if chunk:
                 text_parts.append(chunk)
+
+    # ── Part 2: trailing editorial blocks rendered as body-level siblings after
+    # the article wrapper. Only meaningful when the bio marker was found (i.e.
+    # Part 1 stopped early); otherwise Part 1 already walked to the page end. ──
+    if bio is not None:
+        body = soup.body
+        main_block = bio
+        while (
+            main_block is not None
+            and main_block.parent is not None
+            and main_block.parent is not body
+        ):
+            main_block = main_block.parent
+
+        if main_block is not None and main_block.parent is body:
+            for sib in main_block.next_siblings:
+                if isinstance(sib, NavigableString):
+                    chunk = str(sib).strip()
+                    if chunk:
+                        text_parts.append(chunk)
+                    continue
+                if not isinstance(sib, Tag):
+                    continue
+                if sib.name in CHROME_TAGS:
+                    continue
+                if TOP_BANNER_CLASS in (sib.get("class") or []):
+                    continue
+                for a in sib.find_all("a"):
+                    _add_anchor(a)
+                block_text = sib.get_text(" ", strip=True)
+                if block_text:
+                    text_parts.append(block_text)
 
     return links, " ".join(text_parts), bio is not None
 
