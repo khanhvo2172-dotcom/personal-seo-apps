@@ -37,6 +37,7 @@ from features import (
     keyword_grouping,
     ranking_tracker,
     settings,
+    watermark_remover,
     youtube_seeding_tracker,
 )
 
@@ -45,6 +46,7 @@ FEATURES = {
     "Humanizer - AI detection": humanizer.render,
     "Check Internal & External Links in Google Docs": check_links.render,
     "Format Google Docs File": format_gdocs.render,
+    "Remove AI Watermarks from Google Docs": watermark_remover.render,
     "Extract & Optimize Images from Google Docs": extract_optimize_images.render,
     "Download Images using GDrive Links": download_gdrive_images.render,
     "Keyword Grouping": keyword_grouping.render,
@@ -61,6 +63,7 @@ FEATURE_ICONS = {
     "Humanizer - AI detection": "🤖",
     "Check Internal & External Links in Google Docs": "🔗",
     "Format Google Docs File": "🛠️",
+    "Remove AI Watermarks from Google Docs": "🧹",
     "Extract & Optimize Images from Google Docs": "🖼️",
     "Download Images using GDrive Links": "⬇️",
     "Keyword Grouping": "🏷️",
