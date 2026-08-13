@@ -412,21 +412,16 @@ def render():
         normalize_spaces = st.checkbox(
             "Normalize look-alike spaces to a normal space",
             value=True,
-            help="Converts non-breaking / thin / em / narrow spaces (etc.) to a plain space (U+0020).",
+            help="Converts non-breaking / thin / em / narrow spaces (etc.) to a plain space (U+0020). "
+            "Safe — nothing visible changes. Recommended: leave on.",
         )
-        with st.expander("Advanced (off by default — can alter legitimate text)"):
-            aggressive = st.checkbox(
-                "Map look-alike letters to ASCII (Cyrillic А→A, fullwidth Ａ→A …)",
-                value=False,
-                help="Risky if the doc legitimately contains Cyrillic or CJK/fullwidth text. "
-                "Leave off unless you know the content is English-only.",
-            )
-            nfkc = st.checkbox(
-                "Apply NFKC Unicode normalization to cleaned characters",
-                value=False,
-                help="Note: NFKC applies only to the report preview here; the in-doc edit is "
-                "character-precise and does not reflow whole paragraphs.",
-            )
+        aggressive = st.checkbox(
+            "Map look-alike letters to ASCII (Cyrillic А→A, fullwidth Ａ→A …)",
+            value=True,
+            help="Fixes disguised letters that look like English but aren't. On by default for "
+            "English-only content. Turn OFF if this doc genuinely contains Russian / Bulgarian / "
+            "CJK / fullwidth text, or it would convert that real text to English letters.",
+        )
         scan = st.form_submit_button("🔍 Scan document", type="primary")
 
     if scan:
