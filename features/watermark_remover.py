@@ -371,6 +371,11 @@ def _resolve_tab(doc, url):
         return doc.get("body", {}).get("content", []), None, None
     wanted = _extract_tab_id(url)
     target = _find_tab(tabs, wanted) if wanted else None
+    if wanted and target is None:
+        raise ValueError(
+            "The tab in this URL was not found. Open the tab you want to clean "
+            "in Google Docs and copy its URL again."
+        )
     if target is None:
         target = tabs[0]
     props = target.get("tabProperties", {}) or {}
@@ -397,7 +402,7 @@ def render():
         "Strips invisible AI/steganographic marks — zero-width spaces & joiners, "
         "bidirectional controls, the byte-order mark, variation selectors and Unicode "
         "tag characters — and normalizes look-alike spaces back to a normal space, in "
-        "the tab you point at. Lossless: visible wording is never changed."
+        "the tab you point at. This cleans hidden Unicode characters; it cannot detect or verify model-level Claude text watermarks."
     )
 
     if not require_auth():
@@ -417,7 +422,7 @@ def render():
         )
         aggressive = st.checkbox(
             "Map look-alike letters to ASCII (Cyrillic А→A, fullwidth Ａ→A …)",
-            value=True,
+            value=False,
             help="Fixes disguised letters that look like English but aren't. On by default for "
             "English-only content. Turn OFF if this doc genuinely contains Russian / Bulgarian / "
             "CJK / fullwidth text, or it would convert that real text to English letters.",
