@@ -154,8 +154,8 @@ def _render_bulk():
 
     st.markdown("#### 2. Review & edit slugs")
     st.caption(
-        "Each doc's images will be saved in a subfolder named after its slug "
-        "(e.g. `costco-dropshipping/costco-dropshipping-1.webp`). Edit any slug below."
+        "Each doc's images are named after its slug "
+        "(e.g. `costco-dropshipping-1.webp`) and placed together in one folder. Edit any slug below."
     )
 
     df = pd.DataFrame(
@@ -254,8 +254,8 @@ def _render_quick_guide():
 
 **Bulk mode extra steps:** after pasting URLs, click **Generate Slugs** to auto-create a
 filename slug from each document's name (e.g. *Costco Dropshipping* → `costco-dropshipping`).
-Review and edit the slugs in the table, then click **Extract & Optimize All**. Each document's
-images are packaged into their own subfolder inside a single ZIP.
+Review and edit the slugs in the table, then click **Extract & Optimize All**. All images from
+every document are named by slug (`slug-1`, `slug-2`, …) and packaged together in one ZIP.
 
 PNG/JPG optimization runs locally. WebP uses Cloudinary for better output quality, so Cloudinary
 credentials are required when choosing `.webp`.
@@ -613,14 +613,14 @@ def _run_bulk_pipeline(docs, mode, target_w, target_h, out_ext, quality, skip_up
 
     with zipfile.ZipFile(zip_buffer, "w", zipfile.ZIP_DEFLATED) as zf:
         for slug, name, entries in prepared:
-            logs.append(f"🗂  {name}  →  {slug}/  ({len(entries)} image(s))")
+            logs.append(f"🗂  {name}  →  {slug}-*  ({len(entries)} image(s))")
             log_area.code("\n".join(logs[-25:]))
 
             seq = 0
             for entry in entries:
                 seq += 1
                 processed += 1
-                path = _unique_path(f"{slug}/{slug}-{seq}{out_ext}", used_paths)
+                path = _unique_path(f"{slug}-{seq}{out_ext}", used_paths)
                 progress.progress(processed / total, text=f"Processing {path}…")
 
                 try:
