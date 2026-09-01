@@ -3,7 +3,9 @@ import os
 import re
 import uuid
 import zipfile
+import unicodedata
 import requests
+import pandas as pd
 import streamlit as st
 from PIL import Image
 from dotenv import load_dotenv
@@ -25,6 +27,22 @@ def render():
     if not require_auth():
         return
 
+    input_mode = st.radio(
+        "Input mode",
+        ["Single document", "Multiple documents (bulk)"],
+        horizontal=True,
+        key="img_input_mode",
+    )
+
+    if input_mode == "Single document":
+        _render_single()
+    else:
+        _render_bulk()
+
+
+# ── Single-document mode (original flow) ──────────────────────
+
+def _render_single():
     with st.form("extract_form"):
         doc_url = st.text_input(
             "Google Docs URL",
@@ -75,18 +93,172 @@ def render():
     )
 
 
+# ── Bulk mode (multiple documents) ────────────────────────────
+
+def _render_bulk():
+    st.markdown("#### 1. Paste Google Docs URLs (one per row)")
+    urls_raw = st.text_area(
+        "Google Docs URLs",
+        height=160,
+        key="bulk_urls",
+        placeholder=(
+            "https://docs.google.com/document/d/AAA.../edit\n"
+            "https://docs.google.com/document/d/BBB.../edit?tab=t.0\n"
+            "https://docs.google.com/document/d/CCC.../edit"
+        ),
+        label_visibility="collapsed",
+    )
+    mode = st.radio(
+        "Extraction mode",
+        ["Current tab (from URL)", "All tabs"],
+        horizontal=True,
+        key="bulk_mode",
+    )
+
+    st.markdown("**Optimization Settings** (applied to every document)")
+    col1, col2, col3 = st.columns(3)
+    with col1:
+        width = st.number_input("Width (px)", value=1200, min_value=1, step=10, key="bulk_w")
+    with col2:
+        height = st.number_input("Height (px)", value=1000, min_value=1, step=10, key="bulk_h")
+    with col3:
+        fmt = st.selectbox("Format", [".jpg", ".jpeg", ".png", ".webp"], index=3, key="bulk_fmt")
+
+    quality = st.slider(
+        "Quality (JPG / WebP lossy)", min_value=1, max_value=100, value=90, key="bulk_q"
+    )
+    skip_upscale = st.checkbox(
+        "Skip resize if image is already smaller than target dimensions",
+        value=True, key="bulk_skip",
+    )
+    webp_lossless = st.checkbox(
+        "WebP: always lossless (overrides auto-threshold)", value=False, key="bulk_lossless"
+    )
+    if fmt == ".webp":
+        st.info(
+            f"☁️ WebP is processed via **Cloudinary API** for superior quality. "
+            f"Images are uploaded temporarily, transformed, then auto-deleted. "
+            f"Quality ≥ {WEBP_LOSSLESS_THRESHOLD} or the checkbox above → lossless encoding."
+        )
+
+    if st.button("🏷️ Generate Slugs", type="primary", key="bulk_gen"):
+        if not urls_raw.strip():
+            st.error("Paste at least one Google Docs URL above.")
+        else:
+            with st.spinner("Fetching document names…"):
+                st.session_state["bulk_docs"] = _generate_bulk_docs(urls_raw)
+
+    docs = st.session_state.get("bulk_docs")
+    if not docs:
+        return
+
+    st.markdown("#### 2. Review & edit slugs")
+    st.caption(
+        "Each doc's images will be saved in a subfolder named after its slug "
+        "(e.g. `costco-dropshipping/costco-dropshipping-1.webp`). Edit any slug below."
+    )
+
+    df = pd.DataFrame(
+        [{"File name": d["name"], "Slug": d["slug"], "URL": d["url"]} for d in docs]
+    )
+    edited = st.data_editor(
+        df,
+        key="bulk_slug_editor",
+        use_container_width=True,
+        hide_index=True,
+        num_rows="fixed",
+        column_config={
+            "File name": st.column_config.TextColumn("File name", disabled=True, width="medium"),
+            "Slug": st.column_config.TextColumn(
+                "Slug (editable)", help="Filename base for this document's images", width="medium"
+            ),
+            "URL": st.column_config.TextColumn("URL", disabled=True, width="large"),
+        },
+    )
+
+    invalid = [d for d in docs if not d["doc_id"]]
+    if invalid:
+        st.warning(
+            f"{len(invalid)} row(s) could not be read (invalid URL or no access) and will be skipped."
+        )
+
+    st.markdown("#### 3. Extract & optimize")
+    if st.button("⬇️ Extract & Optimize All", type="primary", key="bulk_extract"):
+        final_docs = []
+        for i, d in enumerate(docs):
+            if not d["doc_id"]:
+                continue
+            try:
+                raw_slug = str(edited.iloc[i]["Slug"])
+            except Exception:
+                raw_slug = d["slug"]
+            slug = _slugify(raw_slug) or d["slug"] or "document"
+            final_docs.append({**d, "slug": slug})
+
+        if not final_docs:
+            st.error("No valid documents to process.")
+        else:
+            _run_bulk_pipeline(
+                final_docs, mode,
+                int(width), int(height), fmt, quality, skip_upscale, webp_lossless,
+            )
+
+
+def _generate_bulk_docs(urls_raw: str) -> list:
+    creds = get_credentials()
+    from googleapiclient.discovery import build
+    drive_service = build("drive", "v3", credentials=creds)
+
+    docs: list = []
+    seen_ids: set = set()
+    for line in urls_raw.splitlines():
+        url = line.strip()
+        if not url:
+            continue
+        try:
+            doc_id = _extract_doc_id(url)
+        except ValueError:
+            docs.append({"url": url, "doc_id": "", "name": "⚠️ Invalid Google Docs URL", "slug": ""})
+            continue
+        if doc_id in seen_ids:
+            continue
+        seen_ids.add(doc_id)
+        try:
+            meta = drive_service.files().get(fileId=doc_id, fields="name").execute()
+            name = meta.get("name", "google-doc")
+            docs.append({"url": url, "doc_id": doc_id, "name": name, "slug": _slugify(name)})
+        except Exception as e:
+            docs.append({"url": url, "doc_id": doc_id, "name": f"⚠️ Could not open ({e})", "slug": ""})
+    return docs
+
+
+def _slugify(text: str) -> str:
+    s = unicodedata.normalize("NFKD", text or "")
+    s = s.encode("ascii", "ignore").decode("ascii")
+    s = s.strip().lower()
+    s = re.sub(r"[^a-z0-9]+", "-", s)
+    s = re.sub(r"-{2,}", "-", s).strip("-")
+    return s or "document"
+
+
 def _render_quick_guide():
     with st.expander("How this works"):
         st.markdown(
             """
 1. Authenticate with Google in **Settings**.
-2. Paste a Google Docs URL.
+2. Pick an **Input mode**:
+   - **Single document** — paste one Google Docs URL, set a filename base, and extract.
+   - **Multiple documents (bulk)** — paste several Google Docs URLs (one per row).
 3. Choose whether to extract images from the current tab or all document tabs.
-4. Set filename base, target width/height, output format, and quality.
-5. Click **Extract & Optimize**.
-6. The app downloads images from the document, resizes/optimizes them, and packages all processed files into a ZIP.
+4. Set target width/height, output format, and quality.
 
-PNG/JPG optimization runs locally. WebP uses Cloudinary for better output quality, so Cloudinary credentials are required when choosing `.webp`.
+**Bulk mode extra steps:** after pasting URLs, click **Generate Slugs** to auto-create a
+filename slug from each document's name (e.g. *Costco Dropshipping* → `costco-dropshipping`).
+Review and edit the slugs in the table, then click **Extract & Optimize All**. Each document's
+images are packaged into their own subfolder inside a single ZIP.
+
+PNG/JPG optimization runs locally. WebP uses Cloudinary for better output quality, so Cloudinary
+credentials are required when choosing `.webp`.
             """.strip()
         )
 
@@ -120,6 +292,16 @@ def _flatten_tabs(doc: dict) -> list:
     for t in doc.get("tabs", []) or []:
         _add(t)
     return out
+
+
+def _pick_tabs(all_tabs: list, url: str, mode: str) -> list:
+    if mode == "All tabs":
+        return all_tabs
+    wanted = _extract_tab_id(url)
+    if wanted:
+        match = [t for t in all_tabs if _tab_id(t) == wanted]
+        return match or [all_tabs[0]]
+    return [all_tabs[0]]
 
 
 def _tab_title(tab: dict) -> str:
@@ -289,7 +471,7 @@ def _optimize_image(raw_bytes, ext, target_w, target_h, quality, skip_upscale, l
     return buf.getvalue(), ""
 
 
-# ── Pipeline ──────────────────────────────────────────────────
+# ── Pipeline (single document) ────────────────────────────────
 
 def _run_pipeline(doc_url, mode, filename_base, target_w, target_h, out_ext, quality, skip_upscale, lossless):
     creds = get_credentials()
@@ -313,15 +495,7 @@ def _run_pipeline(doc_url, mode, filename_base, target_w, target_h, out_ext, qua
         st.error("No tabs found in the document.")
         return
 
-    if mode == "All tabs":
-        chosen_tabs = all_tabs
-    else:
-        wanted = _extract_tab_id(doc_url)
-        if wanted:
-            match = [t for t in all_tabs if _tab_id(t) == wanted]
-            chosen_tabs = match or [all_tabs[0]]
-        else:
-            chosen_tabs = [all_tabs[0]]
+    chosen_tabs = _pick_tabs(all_tabs, doc_url, mode)
 
     # Collect all entries upfront so we know the total for progress
     tab_entries = {_tab_id(t) or str(i): (_tab_title(t), _collect_entries(t))
@@ -386,3 +560,115 @@ def _run_pipeline(doc_url, mode, filename_base, target_w, target_h, out_ext, qua
         file_name=f"{safe_name}_images.zip",
         mime="application/zip",
     )
+
+
+# ── Pipeline (bulk documents) ─────────────────────────────────
+
+def _run_bulk_pipeline(docs, mode, target_w, target_h, out_ext, quality, skip_upscale, lossless):
+    creds = get_credentials()
+    from googleapiclient.discovery import build
+    docs_service = build("docs", "v1", credentials=creds)
+
+    # Pass 1: fetch each doc and collect its image entries (so we know the grand total).
+    prepared: list = []  # (slug, name, entries)
+    fetch_fail = 0
+    with st.spinner("Reading documents…"):
+        for d in docs:
+            try:
+                doc = docs_service.documents().get(
+                    documentId=d["doc_id"], includeTabsContent=True
+                ).execute()
+                all_tabs = _flatten_tabs(doc)
+                if not all_tabs:
+                    prepared.append((d["slug"], d["name"], []))
+                    continue
+                chosen = _pick_tabs(all_tabs, d["url"], mode)
+                entries: list = []
+                for t in chosen:
+                    entries.extend(_collect_entries(t))
+                prepared.append((d["slug"], d["name"], entries))
+            except Exception as e:
+                fetch_fail += 1
+                prepared.append((d["slug"], f"{d['name']} — FETCH FAILED: {e}", []))
+
+    total = sum(len(e) for _, _, e in prepared)
+    if total == 0:
+        st.warning("No images found across the selected document(s).")
+        return
+
+    st.info(
+        f"📚 {len(docs)} document(s), {total} image(s) to process"
+        + (f" — ⚠️ {fetch_fail} document(s) could not be read" if fetch_fail else "")
+    )
+
+    progress = st.progress(0, text="Processing images…")
+    log_area = st.empty()
+    logs: list[str] = []
+
+    zip_buffer = io.BytesIO()
+    used_paths: set = set()
+    processed = 0
+    written = 0
+    total_out_bytes = 0
+
+    with zipfile.ZipFile(zip_buffer, "w", zipfile.ZIP_DEFLATED) as zf:
+        for slug, name, entries in prepared:
+            logs.append(f"🗂  {name}  →  {slug}/  ({len(entries)} image(s))")
+            log_area.code("\n".join(logs[-25:]))
+
+            seq = 0
+            for entry in entries:
+                seq += 1
+                processed += 1
+                path = _unique_path(f"{slug}/{slug}-{seq}{out_ext}", used_paths)
+                progress.progress(processed / total, text=f"Processing {path}…")
+
+                try:
+                    raw = _fetch_image_bytes(entry["chosenUri"], creds)
+                    optimized, note = _optimize_image(
+                        raw, out_ext, target_w, target_h, quality, skip_upscale, lossless
+                    )
+                    zf.writestr(path, optimized)
+                    written += 1
+                    total_out_bytes += len(optimized)
+                    note_str = f"  [{note}]" if note else ""
+                    logs.append(
+                        f"  ✅ {path}"
+                        f"  ({len(raw)//1024} KB → {len(optimized)//1024} KB){note_str}"
+                    )
+                except Exception as ex:
+                    logs.append(f"  ❌ {path} — {ex}")
+
+                log_area.code("\n".join(logs[-25:]))
+
+    zip_buffer.seek(0)
+    progress.progress(1.0, text="Done!")
+    log_area.empty()
+
+    total_mb = total_out_bytes / (1024 * 1024)
+    failed = processed - written
+    msg = f"✅ Done! {written} image(s) across {len(docs)} document(s) — {total_mb:.2f} MB total"
+    if failed:
+        msg += f"  (⚠️ {failed} image(s) failed — see log above)"
+    st.success(msg)
+
+    st.download_button(
+        label="⬇️ Download bulk_images.zip",
+        data=zip_buffer,
+        file_name="bulk_images.zip",
+        mime="application/zip",
+    )
+
+
+def _unique_path(path: str, used: set) -> str:
+    if path not in used:
+        used.add(path)
+        return path
+    stem, dot, ext = path.rpartition(".")
+    i = 2
+    while True:
+        cand = f"{stem}-{i}.{ext}" if dot else f"{path}-{i}"
+        if cand not in used:
+            used.add(cand)
+            return cand
+        i += 1
