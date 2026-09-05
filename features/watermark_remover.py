@@ -19,6 +19,7 @@ import hashlib
 import io
 import re
 import struct
+import zipfile
 import zlib
 from dataclasses import dataclass, field
 from enum import Enum
@@ -976,6 +977,8 @@ def render():
     if not files:
         return
 
+    cleaned_files: list[tuple[str, bytes]] = []  # (filename, bytes) for bulk ZIP
+
     for uf in files:
         data = uf.getvalue()
         fmt = _detect_format(data)
@@ -1023,11 +1026,36 @@ def render():
 
             ext = "png" if fmt == "png" else "jpg"
             base = uf.name.rsplit(".", 1)[0]
+            out_name = f"{base}_cleaned.{ext}"
+            cleaned_files.append((out_name, cleaned))
             st.download_button(
                 f"⬇️ Download cleaned {uf.name}",
                 data=cleaned,
-                file_name=f"{base}_cleaned.{ext}",
+                file_name=out_name,
                 mime=f"image/{ 'png' if fmt == 'png' else 'jpeg' }",
-                type="primary",
                 key=f"dl_{uf.name}_{mode}",
             )
+
+    # Bulk download — all cleaned images in one ZIP.
+    if len(cleaned_files) > 1:
+        zip_buf = io.BytesIO()
+        with zipfile.ZipFile(zip_buf, "w", zipfile.ZIP_STORED) as zf:
+            used: dict[str, int] = {}
+            for name, blob in cleaned_files:
+                # Guard against duplicate names collapsing in the archive.
+                if name in used:
+                    used[name] += 1
+                    stem, _, e = name.rpartition(".")
+                    name = f"{stem}_{used[name]}.{e}"
+                else:
+                    used[name] = 0
+                zf.writestr(name, blob)
+        st.divider()
+        st.download_button(
+            f"📦 Download all {len(cleaned_files)} cleaned images (ZIP)",
+            data=zip_buf.getvalue(),
+            file_name=f"cleaned_images_{mode}.zip",
+            mime="application/zip",
+            type="primary",
+            key=f"dl_all_{mode}",
+        )
