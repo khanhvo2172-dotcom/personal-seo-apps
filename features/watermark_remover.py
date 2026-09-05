@@ -1,547 +1,1033 @@
-"""Remove AI "watermarks" from a single Google Docs tab.
+"""Remove AI/metadata fingerprints from uploaded images.
 
-The cleaning logic (Layer A: invisible/format Unicode + space homoglyphs) is
-ported from the open-source project guillaumemeyer/watermarks-remover
-(skills/remove-ai-marks/scripts/text_unicode.py). We keep the code-point tables
-verbatim and apply the same deterministic scrub, then write the changes back
-in place to the chosen tab via the Google Docs API (batchUpdate).
+Self-contained port of the `imgclean` engine from
+https://github.com/lhfer/image-fingerprint-remover — detection + cleaning for
+JPEG and PNG, offered as a Streamlit feature.
 
-Layer B (statistical, token-sampling watermarks removed by rewriting the prose)
-is intentionally NOT included here — it degrades the original writing and needs
-an LLM. This feature is purely the safe, lossless Layer A cleanup.
+Three cleaning modes:
+  • safe     — strip identifying metadata only; pixels stay byte-identical.
+  • paranoid — safe + re-encode pixels with light Gaussian noise (σ=0.5) to
+               neutralize JPEG quantization-table fingerprints.
+  • nuclear  — paranoid + resize / crop / color-shift to disrupt frequency-domain
+               robust watermarks (SynthID, Digimarc, IMATAG). Visible-but-mild.
+
+Everything runs locally in the app process; no image leaves the server.
 """
+from __future__ import annotations
 
-import unicodedata
-from urllib.parse import urlparse, parse_qs
+import hashlib
+import io
+import re
+import struct
+import zlib
+from dataclasses import dataclass, field
+from enum import Enum
 
+import numpy as np
 import pandas as pd
 import streamlit as st
+from PIL import Image
 
-from features.auth import get_credentials, require_auth
+# ══════════════════════════════════════════════════════════════════════════════
+# findings.py — severity / category enums + report dataclasses
+# ══════════════════════════════════════════════════════════════════════════════
 
-# ── Layer A tables (verbatim from watermarks-remover / text_unicode.py) ──────────
 
-# Format / invisible controls commonly used for steganography or broken pastes.
-STRIP_CODEPOINTS: frozenset[int] = frozenset(
-    {
-        0x00AD,  # soft hyphen
-        0x034F,  # combining grapheme joiner
-        0x061C,  # Arabic letter mark
-        0x115F,  # Hangul choseong filler
-        0x1160,  # Hangul jungseong filler
-        0x17B4,  # Khmer vowel inherent AQ
-        0x17B5,  # Khmer vowel inherent AA
-        0x180B,  # Mongolian free variation selector-1
-        0x180C,
-        0x180D,
-        0x180E,  # Mongolian vowel separator
-        0x200B,  # zero width space
-        0x200C,  # zero width non-joiner
-        0x200D,  # zero width joiner
-        0x200E,  # LRM
-        0x200F,  # RLM
-        0x202A,  # LRE
-        0x202B,  # RLE
-        0x202C,  # PDF
-        0x202D,  # LRO
-        0x202E,  # RLO
-        0x2060,  # word joiner
-        0x2061,  # function application
-        0x2062,  # invisible times
-        0x2063,  # invisible separator
-        0x2064,  # invisible plus
-        0x2066,  # LRI
-        0x2067,  # RLI
-        0x2068,  # FSI
-        0x2069,  # PDI
-        0x206A,  # inhibit symmetric swapping
-        0x206B,
-        0x206C,
-        0x206D,
-        0x206E,
-        0x206F,
-        0xFEFF,  # BOM / ZWNBSP
-        0xFE00,  # variation selectors
-        0xFE01,
-        0xFE02,
-        0xFE03,
-        0xFE04,
-        0xFE05,
-        0xFE06,
-        0xFE07,
-        0xFE08,
-        0xFE09,
-        0xFE0A,
-        0xFE0B,
-        0xFE0C,
-        0xFE0D,
-        0xFE0E,
-        0xFE0F,
-        0xFFF9,  # interlinear annotation
-        0xFFFA,
-        0xFFFB,
-    }
-)
+class Severity(str, Enum):
+    INFO = "info"
+    LOW = "low"
+    MED = "medium"
+    HIGH = "high"
+    CRITICAL = "critical"
 
-# Spaces that look like (or substitute for) U+0020.
-SPACE_HOMOGLYPHS: dict[int, str] = {
-    0x00A0: " ",  # no-break space
-    0x1680: " ",  # Ogham space mark
-    0x2000: " ",  # en quad
-    0x2001: " ",  # em quad
-    0x2002: " ",  # en space
-    0x2003: " ",  # em space
-    0x2004: " ",  # three-per-em space
-    0x2005: " ",  # four-per-em space
-    0x2006: " ",  # six-per-em space
-    0x2007: " ",  # figure space
-    0x2008: " ",  # punctuation space
-    0x2009: " ",  # thin space
-    0x200A: " ",  # hair space
-    0x202F: " ",  # narrow no-break space
-    0x205F: " ",  # medium mathematical space
-    0x3000: " ",  # ideographic space
+
+_SEV_RANK = {
+    Severity.INFO: 0,
+    Severity.LOW: 1,
+    Severity.MED: 2,
+    Severity.HIGH: 3,
+    Severity.CRITICAL: 4,
 }
-
-# Optional confusable Latin lookalikes (aggressive mode only).
-LATIN_CONFUSABLES: dict[int, str] = {
-    0x0410: "A",  # Cyrillic
-    0x0412: "B",
-    0x0415: "E",
-    0x041A: "K",
-    0x041C: "M",
-    0x041D: "H",
-    0x041E: "O",
-    0x0420: "P",
-    0x0421: "C",
-    0x0422: "T",
-    0x0425: "X",
-    0x0430: "a",
-    0x0435: "e",
-    0x043E: "o",
-    0x0440: "p",
-    0x0441: "c",
-    0x0443: "y",
-    0x0445: "x",
-    0x0456: "i",
-    0xFF21: "A",  # fullwidth
-    0xFF22: "B",
-    0xFF23: "C",
-    0xFF24: "D",
-    0xFF25: "E",
-    0xFF26: "F",
-    0xFF27: "G",
-    0xFF28: "H",
-    0xFF29: "I",
-    0xFF2A: "J",
-    0xFF2B: "K",
-    0xFF2C: "L",
-    0xFF2D: "M",
-    0xFF2E: "N",
-    0xFF2F: "O",
-    0xFF30: "P",
-    0xFF31: "Q",
-    0xFF32: "R",
-    0xFF33: "S",
-    0xFF34: "T",
-    0xFF35: "U",
-    0xFF36: "V",
-    0xFF37: "W",
-    0xFF38: "X",
-    0xFF39: "Y",
-    0xFF3A: "Z",
-    0xFF41: "a",
-    0xFF42: "b",
-    0xFF43: "c",
-    0xFF44: "d",
-    0xFF45: "e",
-    0xFF46: "f",
-    0xFF47: "g",
-    0xFF48: "h",
-    0xFF49: "i",
-    0xFF4A: "j",
-    0xFF4B: "k",
-    0xFF4C: "l",
-    0xFF4D: "m",
-    0xFF4E: "n",
-    0xFF4F: "o",
-    0xFF50: "p",
-    0xFF51: "q",
-    0xFF52: "r",
-    0xFF53: "s",
-    0xFF54: "t",
-    0xFF55: "u",
-    0xFF56: "v",
-    0xFF57: "w",
-    0xFF58: "x",
-    0xFF59: "y",
-    0xFF5A: "z",
-}
-
-# Variation selectors beyond FE0x (VS17-VS256 in Supplementary Special-purpose)
-_VS_SUPPLEMENT = range(0xE0100, 0xE01F0)
-
-_BIDI_CPS: frozenset[int] = frozenset(
-    {0x061C, 0x200E, 0x200F, 0x202A, 0x202B, 0x202C, 0x202D, 0x202E, 0x2066, 0x2067, 0x2068, 0x2069}
-)
-_ZW_FAMILY: frozenset[int] = frozenset({0x200B, 0x200C, 0x200D, 0x2060, 0xFEFF, 0x180E})
-
-
-def _is_strip_cp(cp: int) -> bool:
-    if cp in STRIP_CODEPOINTS:
-        return True
-    if cp in _VS_SUPPLEMENT:
-        return True
-    # Tag characters used in some stego schemes (U+E0001-U+E007F)
-    if 0xE0001 <= cp <= 0xE007F:
-        return True
-    return False
-
-
-def _strip_kind(cp: int) -> str:
-    if 0xE0001 <= cp <= 0xE007F:
-        return "tag_chars"
-    if cp in _VS_SUPPLEMENT or 0xFE00 <= cp <= 0xFE0F or 0x180B <= cp <= 0x180D:
-        return "variation_selector"
-    if cp in _BIDI_CPS:
-        return "bidi"
-    if cp in _ZW_FAMILY:
-        return "zwj_family"
-    return "strip"
-
-
-# Friendly names for the report grouping.
-_KIND_LABELS = {
-    "zwj_family": "Zero-width / joiner",
-    "bidi": "Bidirectional control",
-    "tag_chars": "Unicode tag character",
-    "variation_selector": "Variation selector",
-    "strip": "Other invisible/format",
-    "other_cf": "Other format (Cf)",
-    "space": "Look-alike space",
-    "confusable": "Look-alike letter",
+_SEV_ICON = {
+    Severity.INFO: "⚪",
+    Severity.LOW: "🔵",
+    Severity.MED: "🟡",
+    Severity.HIGH: "🟠",
+    Severity.CRITICAL: "🔴",
 }
 
 
-def _char_label(ch: str) -> str:
-    cp = ord(ch)
-    name = unicodedata.name(ch, "UNKNOWN")
-    cat = unicodedata.category(ch)
-    return f"U+{cp:04X} {name} ({cat})"
+class Category(str, Enum):
+    EXIF = "exif"
+    XMP = "xmp"
+    IPTC = "iptc"
+    ICC = "icc"
+    THUMBNAIL = "thumbnail"
+    PNG_TEXT = "png_text"
+    PNG_CHUNK = "png_chunk_unknown"
+    JPEG_APP = "jpeg_app_segment"
+    JPEG_COMMENT = "jpeg_comment"
+    JPEG_QT = "jpeg_quantization_table"
+    C2PA = "c2pa_manifest"
+    AI_PROMPT = "ai_generation_prompt"
+    AI_TAG = "ai_generation_tag"
+    GPS = "gps_location"
+    SERIAL = "device_serial"
+    TRAILING = "trailing_bytes"
+    FS_META = "filesystem_metadata"
+    OTHER = "other"
 
 
-def _classify(ch: str, *, normalize_spaces: bool, aggressive: bool):
-    """Return (kind, replacement) for a suspicious char, else None.
-
-    replacement is None for pure removals, or the ASCII string to substitute.
-    """
-    cp = ord(ch)
-    if _is_strip_cp(cp):
-        return _strip_kind(cp), None
-    if normalize_spaces and cp in SPACE_HOMOGLYPHS:
-        return "space", SPACE_HOMOGLYPHS[cp]
-    if aggressive and cp in LATIN_CONFUSABLES:
-        return "confusable", LATIN_CONFUSABLES[cp]
-    # Other format chars (Cf) not already covered — strip for hygiene, matching
-    # watermarks-remover's clean_text default.
-    if unicodedata.category(ch) == "Cf" and cp not in SPACE_HOMOGLYPHS:
-        return "other_cf", None
-    return None
-
-
-def _utf16_len(ch: str) -> int:
-    """Google Docs indices are in UTF-16 code units; supplementary chars take 2."""
-    return 2 if ord(ch) > 0xFFFF else 1
+_CAT_LABELS = {
+    Category.EXIF: "EXIF metadata",
+    Category.XMP: "XMP packet",
+    Category.IPTC: "Photoshop / IPTC",
+    Category.ICC: "ICC color profile",
+    Category.THUMBNAIL: "Embedded thumbnail",
+    Category.PNG_TEXT: "PNG text chunk",
+    Category.PNG_CHUNK: "Non-standard PNG chunk",
+    Category.JPEG_APP: "JPEG APPn segment",
+    Category.JPEG_COMMENT: "JPEG comment",
+    Category.JPEG_QT: "Quantization table",
+    Category.C2PA: "C2PA / Content Credentials",
+    Category.AI_PROMPT: "AI generation prompt",
+    Category.AI_TAG: "AI generation tag",
+    Category.GPS: "GPS location",
+    Category.SERIAL: "Device serial",
+    Category.TRAILING: "Trailing bytes",
+    Category.FS_META: "Filesystem metadata",
+    Category.OTHER: "Other",
+}
 
 
-# ── document walk ────────────────────────────────────────────────────────────────
-
-def _walk_text_runs(elements, out):
-    """Yield every textRun element (with its startIndex) in document order.
-
-    Recurses into tables and the table of contents — the same reach the
-    Format-Google-Docs feature edits.
-    """
-    for el in elements or []:
-        if "paragraph" in el:
-            for pe in el["paragraph"].get("elements", []) or []:
-                tr = pe.get("textRun")
-                if tr and pe.get("startIndex") is not None:
-                    out.append((pe["startIndex"], tr.get("content", "") or ""))
-        elif "table" in el:
-            for row in el["table"].get("tableRows", []) or []:
-                for cell in row.get("tableCells", []) or []:
-                    _walk_text_runs(cell.get("content", []), out)
-        elif "tableOfContents" in el:
-            _walk_text_runs(el["tableOfContents"].get("content", []), out)
+@dataclass
+class Finding:
+    category: Category
+    severity: Severity
+    location: str
+    name: str
+    detail: str
+    size_bytes: int = 0
+    value_preview: str = ""
+    source: str = ""
+    extra: dict = field(default_factory=dict)
 
 
-def _scan(body_content, tab_id, *, normalize_spaces, aggressive):
-    """Return (edits, stats).
+@dataclass
+class InspectReport:
+    format: str
+    file_size: int
+    findings: list = field(default_factory=list)
+    notes: list = field(default_factory=list)
 
-    edits: list of dicts {start, end, insert} in absolute UTF-16 indices.
-           insert is "" for removals, or the replacement string.
-    stats: dict with per-kind counts and per-character label counts.
-    """
-    runs = []
-    _walk_text_runs(body_content, runs)
-
-    edits = []
-    kind_counts: dict[str, int] = {}
-    char_rows: dict[str, dict] = {}
-
-    for run_start, content in runs:
-        offset = 0  # UTF-16 units into this run
-        for ch in content:
-            w = _utf16_len(ch)
-            hit = _classify(ch, normalize_spaces=normalize_spaces, aggressive=aggressive)
-            if hit is not None:
-                kind, repl = hit
-                abs_start = run_start + offset
-                edits.append({"start": abs_start, "end": abs_start + w, "insert": repl or ""})
-                kind_counts[kind] = kind_counts.get(kind, 0) + 1
-                label = _char_label(ch)
-                row = char_rows.setdefault(
-                    label, {"label": label, "kind": kind, "count": 0, "action": "→ space" if repl == " " else ("→ '" + repl + "'" if repl else "removed")}
-                )
-                row["count"] += 1
-            offset += w
-
-    stats = {
-        "total": len(edits),
-        "kind_counts": kind_counts,
-        "char_rows": sorted(char_rows.values(), key=lambda r: -r["count"]),
-    }
-    return edits, stats
-
-
-def _apply_edits(docs_service, doc_id, tab_id, edits):
-    """Apply edits via batchUpdate. Process in descending start order so earlier
-    (higher-index) edits never shift the indices of later (lower-index) ones."""
-    if not edits:
-        return
-    requests = []
-    for e in sorted(edits, key=lambda x: -x["start"]):
-        rng = {"startIndex": e["start"], "endIndex": e["end"]}
-        loc = {"index": e["start"]}
-        if tab_id:
-            rng["tabId"] = tab_id
-            loc["tabId"] = tab_id
-        # Delete the offending character(s) first...
-        requests.append({"deleteContentRange": {"range": rng}})
-        # ...then, for replacements, insert the ASCII substitute at the same spot.
-        if e["insert"]:
-            requests.append({"insertText": {"location": loc, "text": e["insert"]}})
-    docs_service.documents().batchUpdate(documentId=doc_id, body={"requests": requests}).execute()
-
-
-# ── tab / URL helpers (aligned with format_gdocs.py) ─────────────────────────────
-
-def _extract_doc_id(url: str) -> str | None:
-    import re
-    m = re.search(r"/document/d/([a-zA-Z0-9_-]+)", url)
-    return m.group(1) if m else None
-
-
-def _extract_tab_id(url: str) -> str | None:
-    parsed = urlparse(url)
-    q = parse_qs(parsed.query)
-    if "tab" in q:
-        return q["tab"][0]
-    frag_q = parse_qs(parsed.fragment.replace("?", "&"))
-    if "tab" in frag_q:
-        return frag_q["tab"][0]
-    return None
-
-
-def _find_tab(tabs, tab_id):
-    for tab in tabs or []:
-        if (tab.get("tabProperties", {}) or {}).get("tabId") == tab_id:
-            return tab
-        child = _find_tab(tab.get("childTabs", []), tab_id)
-        if child:
-            return child
-    return None
-
-
-def _resolve_tab(doc, url):
-    """Return (body_content, tab_id, tab_name). tab_id is None for legacy docs."""
-    tabs = doc.get("tabs", [])
-    if not tabs:
-        return doc.get("body", {}).get("content", []), None, None
-    wanted = _extract_tab_id(url)
-    target = _find_tab(tabs, wanted) if wanted else None
-    if wanted and target is None:
-        raise ValueError(
-            "The tab in this URL was not found. Open the tab you want to clean "
-            "in Google Docs and copy its URL again."
+    @property
+    def is_clean(self) -> bool:
+        # Clean = no MED/HIGH/CRITICAL findings. INFO/LOW are residual fingerprints
+        # (quantization tables, standard ICC) that only paranoid/nuclear neutralize.
+        return not any(
+            f.severity in (Severity.MED, Severity.HIGH, Severity.CRITICAL)
+            for f in self.findings
         )
-    if target is None:
-        target = tabs[0]
-    props = target.get("tabProperties", {}) or {}
-    doc_tab = target.get("documentTab", {})
-    return (
-        doc_tab.get("body", {}).get("content", []),
-        props.get("tabId"),
-        props.get("title"),
-    )
 
 
-# ── scan-and-clean orchestration ─────────────────────────────────────────────────
+# ══════════════════════════════════════════════════════════════════════════════
+# fingerprints.py — known AI / editor signatures
+# ══════════════════════════════════════════════════════════════════════════════
 
-def _fetch_doc(creds, doc_id):
-    from googleapiclient.discovery import build
-    docs_service = build("docs", "v1", credentials=creds)
-    doc = docs_service.documents().get(documentId=doc_id, includeTabsContent=True).execute()
-    return docs_service, doc
+PNG_AI_TEXT_KEYS = {
+    "parameters": ("Stable Diffusion (A1111)",
+                   "Automatic1111 web-UI stores full prompt, seed, model hash, sampler in this key."),
+    "prompt": ("ComfyUI / generic prompt",
+               "ComfyUI stores the API prompt JSON in this key."),
+    "workflow": ("ComfyUI workflow",
+                 "ComfyUI stores the full node graph JSON in this key."),
+    "comfy": ("ComfyUI", "Marker key written by ComfyUI exporters."),
+    "sd-metadata": ("InvokeAI",
+                    "InvokeAI stores its generation metadata under this key."),
+    "invokeai": ("InvokeAI", "InvokeAI generation marker."),
+    "novelai": ("NovelAI", "NovelAI generation marker."),
+    "dream": ("Dream/InvokeAI", "InvokeAI dream parameters key."),
+    "openai": ("OpenAI / ChatGPT", "OpenAI image-generation marker."),
+    "dall-e": ("DALL-E", "DALL-E generation marker."),
+    "midjourney": ("Midjourney", "Midjourney generation marker."),
+    "firefly": ("Adobe Firefly", "Adobe Firefly generation marker."),
+}
+
+PNG_AI_VALUE_PATTERNS = [
+    (re.compile(r"\bSteps:\s*\d+", re.I), "Stable Diffusion A1111 parameter block"),
+    (re.compile(r"\bSampler:\s*[A-Za-z]", re.I), "Stable Diffusion sampler block"),
+    (re.compile(r"\bModel hash:\s*[0-9a-f]{6,}", re.I), "Stable Diffusion model hash"),
+    (re.compile(r"\bCFG scale:\s*[\d.]+", re.I), "Stable Diffusion CFG scale"),
+    (re.compile(r'"class_type"\s*:', re.I), "ComfyUI node graph JSON"),
+    (re.compile(r"midjourney|--ar\s+\d+:\d+|--v\s+\d", re.I), "Midjourney prompt block"),
+    (re.compile(r"dall[\s\-]?e|gpt[\s\-]?image|openai", re.I), "OpenAI/DALL-E marker"),
+    (re.compile(r"stable[\s\-]?diffusion|automatic1111|a1111", re.I), "Stable Diffusion marker"),
+    (re.compile(r"firefly|adobe stock", re.I), "Adobe marker"),
+    (re.compile(r"trainedalgorithmicmedia|compositewithtrainedalgorithmicmedia", re.I),
+     "IPTC DigitalSourceType = AI-generated"),
+]
+
+XMP_AI_PATTERNS = [
+    (re.compile(r"Iptc4xmpExt:DigitalSourceType[^<]*trainedAlgorithmicMedia", re.I),
+     "IPTC DigitalSourceType = trainedAlgorithmicMedia"),
+    (re.compile(r"Iptc4xmpExt:DigitalSourceType[^<]*compositeWithTrainedAlgorithmicMedia", re.I),
+     "IPTC DigitalSourceType = compositeWithTrainedAlgorithmicMedia"),
+    (re.compile(r"<xmpMM:History>.*?</xmpMM:History>", re.S | re.I),
+     "Adobe XMP edit history (may leak editor + actions)"),
+    (re.compile(r"<photoshop:[A-Z]\w+>", re.I), "Photoshop XMP tag"),
+    (re.compile(r"firefly|adobe stock|adobestock", re.I), "Adobe Firefly/Stock marker"),
+    (re.compile(r"openai|chatgpt|dall[\s\-]?e", re.I), "OpenAI/DALL-E marker"),
+    (re.compile(r"midjourney", re.I), "Midjourney marker"),
+    (re.compile(r"stable[\s\-]?diffusion|stability\.ai", re.I), "Stable Diffusion marker"),
+    (re.compile(r"generativeAI|generative-ai", re.I), "Generic generative-AI marker"),
+]
+
+JUMBF_MAGIC = b"jumb"
+C2PA_LABELS = [b"c2pa", b"c2ma", b"c2as", b"c2cl"]
+PHOTOSHOP_HEADER = b"Photoshop 3.0\x00"
+ADOBE_APP14 = b"Adobe\x00"
+
+EXIF_LEAK_TAGS = {
+    "Make", "Model", "Software", "BodySerialNumber", "SerialNumber",
+    "LensSerialNumber", "OwnerName", "Artist", "Copyright", "UserComment",
+    "ImageUniqueID", "DateTimeOriginal", "DateTimeDigitized", "ImageDescription",
+    "HostComputer", "CameraOwnerName",
+}
+GPS_TAGS_PREFIX = "GPS"
+
+PNG_CRITICAL_CHUNKS = {b"IHDR", b"PLTE", b"IDAT", b"IEND"}
+PNG_SAFE_ANCILLARY = {
+    b"tRNS", b"gAMA", b"cHRM", b"sBIT", b"bKGD", b"hIST", b"sRGB",
+    b"acTL", b"fcTL", b"fdAT",  # APNG animation
+}
+
+PNG_HEADER = b"\x89PNG\r\n\x1a\n"
+SOI = b"\xff\xd8"
+EOI = b"\xff\xd9"
+SOS = 0xDA
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# detect/png.py — PNG chunk-level inspector
+# ══════════════════════════════════════════════════════════════════════════════
+
+
+def _iter_chunks(data: bytes):
+    """Yield (offset, type, data) for each PNG chunk. Tolerates trailing bytes."""
+    if not data.startswith(PNG_HEADER):
+        return
+    off = len(PNG_HEADER)
+    n = len(data)
+    while off + 8 <= n:
+        (length,) = struct.unpack(">I", data[off:off + 4])
+        ctype = data[off + 4:off + 8]
+        body = data[off + 8:off + 8 + length]
+        yield off, ctype, body
+        off += 12 + length
+        if ctype == b"IEND":
+            break
+
+
+def _decode_png_text(body: bytes, chunk_type: bytes):
+    """Decode a tEXt/zTXt/iTXt chunk body into (key, value)."""
+    try:
+        if chunk_type == b"tEXt":
+            k, _, v = body.partition(b"\x00")
+            return k.decode("latin1", "replace"), v.decode("latin1", "replace")
+        if chunk_type == b"zTXt":
+            k, _, rest = body.partition(b"\x00")
+            if not rest:
+                return k.decode("latin1", "replace"), ""
+            comp = rest[1:]  # rest[0] is compression method (0 = zlib)
+            try:
+                v = zlib.decompress(comp).decode("utf-8", "replace")
+            except zlib.error:
+                v = f"<zlib decode error, {len(comp)} bytes>"
+            return k.decode("latin1", "replace"), v
+        if chunk_type == b"iTXt":
+            try:
+                k, rest = body.split(b"\x00", 1)
+                comp_flag = rest[0]
+                lang, rest2 = rest[2:].split(b"\x00", 1)
+                trans, text = rest2.split(b"\x00", 1)
+                if comp_flag:
+                    try:
+                        text = zlib.decompress(text)
+                    except zlib.error:
+                        pass
+                return k.decode("utf-8", "replace"), text.decode("utf-8", "replace")
+            except (ValueError, IndexError):
+                return "<malformed iTXt>", body[:200].decode("utf-8", "replace")
+    except Exception as exc:
+        return f"<error: {exc}>", ""
+    return "<unknown>", ""
+
+
+def _match_ai_keys(key: str, value: str):
+    """Return (label, why) if the text chunk looks like an AI fingerprint."""
+    kl = key.lower().strip()
+    if kl in PNG_AI_TEXT_KEYS:
+        return PNG_AI_TEXT_KEYS[kl]
+    for pat, why in PNG_AI_VALUE_PATTERNS:
+        if pat.search(value):
+            return "AI generation marker", why
+    for pat, why in XMP_AI_PATTERNS:
+        if pat.search(value):
+            return "AI generation marker (XMP)", why
+    return None, None
+
+
+def _inspect_png(data: bytes, report: InspectReport) -> None:
+    if not data.startswith(PNG_HEADER):
+        report.notes.append("PNG magic missing — not a PNG.")
+        return
+
+    last_end = len(PNG_HEADER)
+    saw_iend = False
+    for off, ctype, body in _iter_chunks(data):
+        last_end = off + 12 + len(body)
+        ctype_s = ctype.decode("latin1", "replace")
+        if ctype in PNG_CRITICAL_CHUNKS or ctype in PNG_SAFE_ANCILLARY:
+            if ctype == b"IEND":
+                saw_iend = True
+            continue
+
+        if ctype in (b"tEXt", b"zTXt", b"iTXt"):
+            key, value = _decode_png_text(body, ctype)
+            label, why = _match_ai_keys(key, value)
+            severity = Severity.HIGH if label else Severity.MED
+            category = Category.AI_PROMPT if label else Category.PNG_TEXT
+            preview = value[:240].replace("\n", " ")
+            detail = f"PNG {ctype_s} key={key!r} ({len(value)} chars)" + (f" — {why}" if why else "")
+            report.findings.append(Finding(
+                category=category, severity=severity,
+                location=f"PNG {ctype_s} @offset={off}",
+                name=label or f"PNG text chunk: {key}",
+                detail=detail, size_bytes=len(body), value_preview=preview, source="png.text",
+            ))
+            continue
+
+        if ctype == b"eXIf":
+            report.findings.append(Finding(
+                category=Category.EXIF, severity=Severity.HIGH,
+                location=f"PNG eXIf @offset={off}", name="Embedded EXIF block in PNG",
+                detail="PNG carries a full EXIF block (may include camera Make/Model, GPS, serial).",
+                size_bytes=len(body), source="png.exif",
+            ))
+            continue
+
+        if ctype == b"iCCP":
+            name, _, _ = body.partition(b"\x00")
+            report.findings.append(Finding(
+                category=Category.ICC, severity=Severity.LOW,
+                location=f"PNG iCCP @offset={off}",
+                name=f"ICC profile: {name.decode('latin1', 'replace')}",
+                detail="Embedded ICC color profile — may carry custom strings or UUIDs.",
+                size_bytes=len(body), source="png.iccp",
+            ))
+            continue
+
+        if ctype == b"tIME":
+            if len(body) == 7:
+                y, mo, d, h, mi, s = struct.unpack(">HBBBBB", body[:7])
+                report.findings.append(Finding(
+                    category=Category.OTHER, severity=Severity.LOW,
+                    location=f"PNG tIME @offset={off}", name="PNG last-modification timestamp",
+                    detail=f"{y:04d}-{mo:02d}-{d:02d} {h:02d}:{mi:02d}:{s:02d} UTC",
+                    size_bytes=len(body), source="png.time",
+                ))
+            continue
+
+        if ctype == b"pHYs":
+            report.findings.append(Finding(
+                category=Category.OTHER, severity=Severity.INFO,
+                location=f"PNG pHYs @offset={off}", name="Pixel-density chunk",
+                detail="Editor-set DPI/aspect — mild fingerprint.",
+                size_bytes=len(body), source="png.phys",
+            ))
+            continue
+
+        if ctype == b"caBX" or (JUMBF_MAGIC in body[:64] and any(lbl in body[:200] for lbl in C2PA_LABELS)):
+            report.findings.append(Finding(
+                category=Category.C2PA, severity=Severity.CRITICAL,
+                location=f"PNG {ctype_s} @offset={off}",
+                name="C2PA / Content Credentials manifest",
+                detail=("JUMBF box containing C2PA manifest — encodes signing entity "
+                        "(camera, OpenAI, Adobe, Google), assertions, edit history, "
+                        "and a content-binding hash."),
+                size_bytes=len(body),
+                value_preview=body[:200].decode("latin1", "replace"), source="png.c2pa",
+            ))
+            continue
+
+        report.findings.append(Finding(
+            category=Category.PNG_CHUNK, severity=Severity.MED,
+            location=f"PNG {ctype_s} @offset={off}",
+            name=f"Non-standard PNG chunk: {ctype_s}",
+            detail="Unknown ancillary chunk — may carry vendor identifiers.",
+            size_bytes=len(body),
+            value_preview=body[:200].decode("latin1", "replace"), source="png.unknown",
+        ))
+
+    if saw_iend and last_end < len(data):
+        trailing = len(data) - last_end
+        report.findings.append(Finding(
+            category=Category.TRAILING, severity=Severity.HIGH,
+            location=f"PNG trailing bytes @offset={last_end}",
+            name="Trailing bytes after IEND",
+            detail=f"{trailing} extra bytes after PNG end-of-file marker — possible appended payload.",
+            size_bytes=trailing,
+            value_preview=data[last_end:last_end + 200].decode("latin1", "replace"),
+            source="png.trailing",
+        ))
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# detect/jpeg.py — JPEG marker-level inspector
+# ══════════════════════════════════════════════════════════════════════════════
+
+
+def _iter_segments(data: bytes):
+    """Yield (offset, marker_code, segment_body) for each JPEG marker segment."""
+    if not data.startswith(SOI):
+        return
+    off = 2
+    n = len(data)
+    while off < n:
+        if data[off] != 0xFF:
+            return
+        while off < n and data[off] == 0xFF:
+            off += 1
+        if off >= n:
+            return
+        marker = data[off]
+        off += 1
+        if marker in (0xD0, 0xD1, 0xD2, 0xD3, 0xD4, 0xD5, 0xD6, 0xD7, 0x01, 0xD8, 0xD9):
+            yield off - 2, marker, b""
+            if marker == 0xD9:  # EOI
+                return
+            continue
+        if off + 2 > n:
+            return
+        (length,) = struct.unpack(">H", data[off:off + 2])
+        body = data[off + 2:off + length]
+        yield off - 2, marker, body
+        off += length
+        if marker == SOS:
+            while off < n - 1:
+                if data[off] == 0xFF and data[off + 1] != 0x00 and data[off + 1] not in (
+                    0xD0, 0xD1, 0xD2, 0xD3, 0xD4, 0xD5, 0xD6, 0xD7
+                ):
+                    break
+                off += 1
+
+
+def _check_xmp(value: str):
+    for pat, why in XMP_AI_PATTERNS:
+        if pat.search(value):
+            return "AI generation marker (XMP)", why
+    return None, None
+
+
+def _parse_exif(body: bytes):
+    """Return (notable tag list, has_gps, has_thumbnail). Best-effort minimal parser."""
+    if not body.startswith(b"Exif\x00\x00"):
+        return [], False, False
+    tiff = body[6:]
+    if len(tiff) < 8:
+        return [], False, False
+    endian = tiff[:2]
+    if endian == b"II":
+        fmt = "<"
+    elif endian == b"MM":
+        fmt = ">"
+    else:
+        return [], False, False
+    magic = struct.unpack(fmt + "H", tiff[2:4])[0]
+    if magic != 0x002A:
+        return [], False, False
+    ifd0_off = struct.unpack(fmt + "I", tiff[4:8])[0]
+
+    TAG_NAMES = {
+        0x010F: "Make", 0x0110: "Model", 0x0131: "Software",
+        0x013B: "Artist", 0x8298: "Copyright", 0x9286: "UserComment",
+        0xA420: "ImageUniqueID", 0xC62F: "BodySerialNumber",
+        0xA431: "SerialNumber", 0xA432: "LensSerialNumber",
+        0x9003: "DateTimeOriginal", 0x9004: "DateTimeDigitized",
+        0x010E: "ImageDescription", 0x013C: "HostComputer",
+        0x8825: "GPSIFD", 0x8769: "ExifIFD",
+    }
+
+    tags = []
+    has_gps = False
+    has_thumb = False
+
+    def read_ifd(ifd_off: int, depth: int = 0) -> int:
+        nonlocal has_gps, has_thumb
+        if ifd_off + 2 > len(tiff) or depth > 3:
+            return 0
+        (count,) = struct.unpack(fmt + "H", tiff[ifd_off:ifd_off + 2])
+        entries_off = ifd_off + 2
+        for i in range(count):
+            e = entries_off + i * 12
+            if e + 12 > len(tiff):
+                return 0
+            (tag, typ, num, val) = struct.unpack(fmt + "HHII", tiff[e:e + 12])
+            name = TAG_NAMES.get(tag)
+            if tag == 0x8825:
+                has_gps = True
+            if name and name not in ("GPSIFD", "ExifIFD"):
+                tv = ""
+                if typ == 2:  # ASCII
+                    if num <= 4:
+                        tv = struct.pack(fmt + "I", val).rstrip(b"\x00").decode("utf-8", "replace")
+                    elif val + num <= len(tiff):
+                        tv = tiff[val:val + num].rstrip(b"\x00").decode("utf-8", "replace")
+                tags.append((name, tv))
+            if tag == 0x8769 and val < len(tiff):
+                read_ifd(val, depth + 1)
+        next_off_pos = entries_off + count * 12
+        if next_off_pos + 4 <= len(tiff):
+            (next_off,) = struct.unpack(fmt + "I", tiff[next_off_pos:next_off_pos + 4])
+            if depth == 0 and next_off:
+                has_thumb = True
+                read_ifd(next_off, depth + 1)
+            return next_off
+        return 0
+
+    try:
+        read_ifd(ifd0_off)
+    except Exception:
+        pass
+    return tags, has_gps, has_thumb
+
+
+def _inspect_jpeg(data: bytes, report: InspectReport) -> None:
+    if not data.startswith(SOI):
+        report.notes.append("JPEG SOI marker missing.")
+        return
+
+    for off, marker, body in _iter_segments(data):
+        if marker == SOS:
+            break
+
+        if marker == 0xFE:  # COM
+            txt = body.decode("utf-8", "replace")
+            report.findings.append(Finding(
+                category=Category.JPEG_COMMENT, severity=Severity.MED,
+                location=f"JPEG COM @offset={off}", name="JPEG free-form comment",
+                detail=f"{len(body)} bytes", size_bytes=len(body),
+                value_preview=txt[:240], source="jpeg.com",
+            ))
+            continue
+
+        if marker == 0xDB:  # DQT
+            h = hashlib.sha1(body).hexdigest()[:12]
+            report.findings.append(Finding(
+                category=Category.JPEG_QT, severity=Severity.LOW,
+                location=f"JPEG DQT @offset={off}", name=f"Quantization table (hash {h})",
+                detail="Camera / encoder fingerprint — survives EXIF strip.",
+                size_bytes=len(body), source="jpeg.dqt", extra={"sha1_12": h},
+            ))
+            continue
+
+        if 0xE0 <= marker <= 0xEF:
+            seg_name = f"APP{marker - 0xE0}"
+
+            if marker == 0xE1:
+                if body.startswith(b"Exif\x00\x00"):
+                    tags, has_gps, has_thumb = _parse_exif(body)
+                    leaked = [(k, v) for k, v in tags if k in EXIF_LEAK_TAGS]
+                    report.findings.append(Finding(
+                        category=Category.EXIF,
+                        severity=Severity.HIGH if leaked or has_gps else Severity.MED,
+                        location=f"JPEG {seg_name} EXIF @offset={off}", name="EXIF metadata block",
+                        detail=(f"{len(tags)} known tags"
+                                + ("; GPS present" if has_gps else "")
+                                + ("; embedded thumbnail" if has_thumb else "")),
+                        size_bytes=len(body),
+                        value_preview="; ".join(f"{k}={v[:60]}" for k, v in leaked[:6]),
+                        source="jpeg.exif",
+                    ))
+                    if has_gps:
+                        report.findings.append(Finding(
+                            category=Category.GPS, severity=Severity.CRITICAL,
+                            location=f"JPEG {seg_name} EXIF GPS IFD @offset={off}",
+                            name="GPS location embedded",
+                            detail="EXIF GPS IFD present — reveals capture location.",
+                            source="jpeg.gps",
+                        ))
+                    if has_thumb:
+                        report.findings.append(Finding(
+                            category=Category.THUMBNAIL, severity=Severity.MED,
+                            location=f"JPEG {seg_name} EXIF IFD1 @offset={off}",
+                            name="Embedded thumbnail",
+                            detail="EXIF IFD1 thumbnail — may show original pre-edit pixels.",
+                            source="jpeg.thumb",
+                        ))
+                    for k, v in tags:
+                        if k.startswith(GPS_TAGS_PREFIX):
+                            continue
+                        if "Serial" in k and v:
+                            report.findings.append(Finding(
+                                category=Category.SERIAL, severity=Severity.CRITICAL,
+                                location=f"JPEG EXIF tag {k}", name=f"Device serial: {k}",
+                                detail=v, source="jpeg.serial",
+                            ))
+                    continue
+                if body.startswith(b"http://ns.adobe.com/xap/1.0/\x00"):
+                    xmp = body[29:].decode("utf-8", "replace")
+                    label, why = _check_xmp(xmp)
+                    report.findings.append(Finding(
+                        category=Category.AI_TAG if label else Category.XMP,
+                        severity=Severity.HIGH if label else Severity.MED,
+                        location=f"JPEG {seg_name} XMP @offset={off}",
+                        name=label or "XMP packet",
+                        detail=why or f"{len(xmp)} chars of XMP metadata",
+                        size_bytes=len(body), value_preview=xmp[:240], source="jpeg.xmp",
+                    ))
+                    continue
+                if body.startswith(b"http://ns.adobe.com/xmp/extension/\x00"):
+                    report.findings.append(Finding(
+                        category=Category.XMP, severity=Severity.MED,
+                        location=f"JPEG {seg_name} XMP-extended @offset={off}",
+                        name="XMP extension packet",
+                        detail=f"{len(body)} bytes (continuation of XMP)",
+                        size_bytes=len(body), source="jpeg.xmp_ext",
+                    ))
+                    continue
+
+            if marker == 0xE2:
+                if body.startswith(b"ICC_PROFILE\x00"):
+                    report.findings.append(Finding(
+                        category=Category.ICC, severity=Severity.LOW,
+                        location=f"JPEG {seg_name} ICC @offset={off}",
+                        name="ICC color profile segment",
+                        detail="Embedded ICC profile — may carry custom strings/UUIDs.",
+                        size_bytes=len(body), source="jpeg.icc",
+                    ))
+                    continue
+                if body.startswith(b"MPF\x00"):
+                    report.findings.append(Finding(
+                        category=Category.THUMBNAIL, severity=Severity.MED,
+                        location=f"JPEG {seg_name} MPF @offset={off}",
+                        name="Multi-picture (MPF) — embedded extra images",
+                        detail="Often contains an additional preview/original frame.",
+                        size_bytes=len(body), source="jpeg.mpf",
+                    ))
+                    continue
+
+            if marker == 0xEB and JUMBF_MAGIC in body[:64]:
+                report.findings.append(Finding(
+                    category=Category.C2PA, severity=Severity.CRITICAL,
+                    location=f"JPEG {seg_name} @offset={off}",
+                    name="C2PA / Content Credentials manifest (JUMBF)",
+                    detail="Encodes signing entity and edit history.",
+                    size_bytes=len(body),
+                    value_preview=body[:200].decode("latin1", "replace"), source="jpeg.c2pa",
+                ))
+                continue
+
+            if marker == 0xED and body.startswith(PHOTOSHOP_HEADER):
+                report.findings.append(Finding(
+                    category=Category.IPTC, severity=Severity.HIGH,
+                    location=f"JPEG {seg_name} Photoshop IRB @offset={off}",
+                    name="Photoshop 8BIM / IPTC block",
+                    detail="Photoshop resource block — may include original filename, paths, URL, IPTC.",
+                    size_bytes=len(body), source="jpeg.psd",
+                ))
+                continue
+
+            if marker == 0xEE and body.startswith(ADOBE_APP14):
+                report.findings.append(Finding(
+                    category=Category.JPEG_APP, severity=Severity.LOW,
+                    location=f"JPEG {seg_name} Adobe @offset={off}",
+                    name="Adobe APP14 marker (DCT transform)",
+                    detail="Identifies file as having passed through an Adobe encoder.",
+                    size_bytes=len(body), source="jpeg.adobe",
+                ))
+                continue
+
+            if marker == 0xE0 and body.startswith(b"JFIF\x00"):
+                continue
+            if marker == 0xE0 and body.startswith(b"JFXX\x00"):
+                report.findings.append(Finding(
+                    category=Category.THUMBNAIL, severity=Severity.MED,
+                    location=f"JPEG APP0 JFXX @offset={off}", name="JFIF extension thumbnail",
+                    detail="JFXX block carries an embedded thumbnail.",
+                    size_bytes=len(body), source="jpeg.jfxx",
+                ))
+                continue
+
+            report.findings.append(Finding(
+                category=Category.JPEG_APP, severity=Severity.MED,
+                location=f"JPEG {seg_name} @offset={off}", name=f"Unknown {seg_name} segment",
+                detail=f"{len(body)} bytes of vendor-specific data.",
+                size_bytes=len(body),
+                value_preview=body[:60].decode("latin1", "replace"), source="jpeg.appn",
+            ))
+
+    eoi_idx = data.rfind(EOI)
+    if eoi_idx != -1 and eoi_idx + 2 < len(data):
+        trailing = len(data) - eoi_idx - 2
+        report.findings.append(Finding(
+            category=Category.TRAILING, severity=Severity.HIGH,
+            location=f"JPEG trailing bytes @offset={eoi_idx + 2}",
+            name="Trailing bytes after EOI",
+            detail=f"{trailing} extra bytes after JPEG end-of-image marker.",
+            size_bytes=trailing,
+            value_preview=data[eoi_idx + 2:eoi_idx + 2 + 200].decode("latin1", "replace"),
+            source="jpeg.trailing",
+        ))
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# clean/png.py — PNG cleaner
+# ══════════════════════════════════════════════════════════════════════════════
+
+
+def _png_crc(chunk_type: bytes, body: bytes) -> bytes:
+    return struct.pack(">I", zlib.crc32(chunk_type + body) & 0xFFFFFFFF)
+
+
+def _encode_chunk(chunk_type: bytes, body: bytes) -> bytes:
+    return struct.pack(">I", len(body)) + chunk_type + body + _png_crc(chunk_type, body)
+
+
+def _png_strip_chunks(data: bytes) -> bytes:
+    """Safe mode: keep only IHDR/PLTE/IDAT/IEND + rendering-relevant ancillaries.
+    Pixel data (IDAT) copied byte-for-byte. Trailing bytes dropped."""
+    out = io.BytesIO()
+    out.write(PNG_HEADER)
+    saw_iend = False
+    for _off, ctype, body in _iter_chunks(data):
+        if ctype in PNG_CRITICAL_CHUNKS or ctype in PNG_SAFE_ANCILLARY:
+            out.write(_encode_chunk(ctype, body))
+            if ctype == b"IEND":
+                saw_iend = True
+    if not saw_iend:
+        out.write(_encode_chunk(b"IEND", b""))
+    return out.getvalue()
+
+
+def _png_reencode_pixels(data: bytes, noise_sigma: float = 0.0) -> bytes:
+    im = Image.open(io.BytesIO(data))
+    im.load()
+    if im.mode not in ("RGB", "RGBA", "L", "LA"):
+        im = im.convert("RGBA" if "A" in im.getbands() else "RGB")
+    arr = np.asarray(im, dtype=np.int16)
+    if noise_sigma > 0:
+        rng = np.random.default_rng()
+        noise = rng.normal(0.0, noise_sigma, arr.shape)
+        arr = np.clip(arr + noise.round().astype(np.int16), 0, 255)
+    arr = arr.astype(np.uint8)
+    out_im = Image.fromarray(arr, mode=im.mode)
+    buf = io.BytesIO()
+    out_im.save(buf, format="PNG", optimize=True)
+    return _png_strip_chunks(buf.getvalue())
+
+
+def _png_nuclear_pixels(data: bytes) -> bytes:
+    """JPEG round-trip + slight resize + 2px crop + color shift to disrupt
+    frequency-domain watermarks (visible-but-mild loss)."""
+    im = Image.open(io.BytesIO(data))
+    im.load()
+    has_alpha = im.mode in ("RGBA", "LA") or (im.mode == "P" and "transparency" in im.info)
+    if not has_alpha:
+        if im.mode != "RGB":
+            im = im.convert("RGB")
+        buf = io.BytesIO()
+        im.save(buf, format="JPEG", quality=92, subsampling=2, optimize=True)
+        im = Image.open(buf)
+        im.load()
+
+    w, h = im.size
+    new_w = max(1, int(round(w * 0.997)))
+    new_h = max(1, int(round(h * 0.997)))
+    im = im.resize((new_w, new_h), Image.LANCZOS)
+    if new_w > 4 and new_h > 4:
+        im = im.crop((2, 2, new_w - 2, new_h - 2))
+
+    arr = np.asarray(im, dtype=np.int16)
+    rng = np.random.default_rng()
+    arr = arr + rng.normal(0.0, 0.7, arr.shape).round().astype(np.int16)
+    if arr.shape[-1] >= 3:
+        bias = rng.integers(-1, 2, size=arr.shape[-1]).astype(np.int16)
+        arr = arr + bias
+    arr = np.clip(arr, 0, 255).astype(np.uint8)
+
+    final = Image.fromarray(arr, mode=im.mode)
+    buf = io.BytesIO()
+    final.save(buf, format="PNG", optimize=True)
+    return _png_strip_chunks(buf.getvalue())
+
+
+def _clean_png(data: bytes, mode: str) -> bytes:
+    if mode == "safe":
+        return _png_strip_chunks(data)
+    if mode == "paranoid":
+        return _png_reencode_pixels(data, noise_sigma=0.5)
+    if mode == "nuclear":
+        return _png_nuclear_pixels(data)
+    raise ValueError(mode)
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# clean/jpeg.py — JPEG cleaner
+# ══════════════════════════════════════════════════════════════════════════════
+
+_KEEP_APP = {0xE0}  # keep only APP0 (JFIF basic) of the APPn range
+
+
+def _jpeg_strip_segments(data: bytes) -> bytes:
+    """Rewrite JPEG keeping all SOFn/DQT/DHT/SOS + entropy scan, dropping every
+    APP1..APP15 and COM segment."""
+    out = io.BytesIO()
+    out.write(SOI)
+    sos_offset = None
+    for off, marker, body in _iter_segments(data):
+        if marker == 0xDA:  # SOS
+            sos_offset = off
+            out.write(bytes([0xFF, marker]))
+            out.write(struct.pack(">H", len(body) + 2))
+            out.write(body)
+            break
+        if marker == 0xFE:  # COM
+            continue
+        if 0xE1 <= marker <= 0xEF:  # APP1..APP15
+            continue
+        if 0xE0 <= marker <= 0xEF and marker not in _KEEP_APP:
+            continue
+        out.write(bytes([0xFF, marker]))
+        if body:
+            out.write(struct.pack(">H", len(body) + 2))
+            out.write(body)
+
+    if sos_offset is None:
+        return data
+
+    scan_start = None
+    for off, marker, body in _iter_segments(data):
+        if marker == 0xDA:
+            scan_start = off + 2 + 2 + len(body)  # 0xFF DA + length(2) + body
+            break
+    if scan_start is None:
+        return data
+
+    eoi = data.rfind(EOI)
+    if eoi == -1:
+        return data
+    out.write(data[scan_start:eoi])
+    out.write(EOI)
+    return out.getvalue()
+
+
+def _jpeg_reencode_pixels(data: bytes, quality: int, noise_sigma: float) -> bytes:
+    im = Image.open(io.BytesIO(data))
+    im.load()
+    if im.mode != "RGB":
+        im = im.convert("RGB")
+    if noise_sigma > 0:
+        arr = np.asarray(im, dtype=np.int16)
+        rng = np.random.default_rng()
+        arr = arr + rng.normal(0.0, noise_sigma, arr.shape).round().astype(np.int16)
+        arr = np.clip(arr, 0, 255).astype(np.uint8)
+        im = Image.fromarray(arr, mode="RGB")
+    buf = io.BytesIO()
+    im.save(buf, format="JPEG", quality=quality, subsampling=2, optimize=True)
+    return _jpeg_strip_segments(buf.getvalue())
+
+
+def _jpeg_nuclear_pixels(data: bytes) -> bytes:
+    im = Image.open(io.BytesIO(data))
+    im.load()
+    if im.mode != "RGB":
+        im = im.convert("RGB")
+    w, h = im.size
+    new_w = max(1, int(round(w * 0.997)))
+    new_h = max(1, int(round(h * 0.997)))
+    im = im.resize((new_w, new_h), Image.LANCZOS)
+    if new_w > 4 and new_h > 4:
+        im = im.crop((2, 2, new_w - 2, new_h - 2))
+    arr = np.asarray(im, dtype=np.int16)
+    rng = np.random.default_rng()
+    arr = arr + rng.normal(0.0, 0.7, arr.shape).round().astype(np.int16)
+    arr = arr + rng.integers(-1, 2, size=(arr.shape[-1],)).astype(np.int16)
+    arr = np.clip(arr, 0, 255).astype(np.uint8)
+    final = Image.fromarray(arr, mode="RGB")
+    buf = io.BytesIO()
+    final.save(buf, format="JPEG", quality=88, subsampling=2, optimize=True)
+    return _jpeg_strip_segments(buf.getvalue())
+
+
+def _clean_jpeg(data: bytes, mode: str) -> bytes:
+    if mode == "safe":
+        return _jpeg_strip_segments(data)
+    if mode == "paranoid":
+        return _jpeg_reencode_pixels(data, quality=92, noise_sigma=0.5)
+    if mode == "nuclear":
+        return _jpeg_nuclear_pixels(data)
+    raise ValueError(mode)
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# format dispatch
+# ══════════════════════════════════════════════════════════════════════════════
+
+
+def _detect_format(data: bytes) -> str | None:
+    if data.startswith(PNG_HEADER):
+        return "png"
+    if data.startswith(SOI):
+        return "jpeg"
+    return None
+
+
+def _inspect(data: bytes) -> InspectReport:
+    fmt = _detect_format(data) or "unknown"
+    report = InspectReport(format=fmt, file_size=len(data))
+    if fmt == "png":
+        _inspect_png(data, report)
+    elif fmt == "jpeg":
+        _inspect_jpeg(data, report)
+    else:
+        report.notes.append("Unsupported format — only PNG and JPEG are supported.")
+    return report
+
+
+def _clean(data: bytes, fmt: str, mode: str) -> bytes:
+    if fmt == "png":
+        return _clean_png(data, mode)
+    if fmt == "jpeg":
+        return _clean_jpeg(data, mode)
+    raise ValueError(f"Unsupported format: {fmt}")
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# Streamlit UI
+# ══════════════════════════════════════════════════════════════════════════════
+
+_MODE_LABELS = {
+    "safe": "Safe — strip metadata only (pixels byte-identical)",
+    "paranoid": "Paranoid — safe + light noise re-encode (kills quantization-table fingerprints)",
+    "nuclear": "Nuclear — paranoid + resize/crop/color-shift (disrupts robust watermarks; visible-but-mild)",
+}
+_MODE_KEYS = list(_MODE_LABELS.keys())
+
+
+def _human_size(n: int) -> str:
+    if n < 1024:
+        return f"{n} B"
+    if n < 1024 * 1024:
+        return f"{n / 1024:.1f} KB"
+    return f"{n / (1024 * 1024):.2f} MB"
+
+
+def _report_dataframe(report: InspectReport) -> pd.DataFrame:
+    rows = []
+    for f in sorted(report.findings, key=lambda x: -_SEV_RANK[x.severity]):
+        rows.append({
+            "Severity": f"{_SEV_ICON[f.severity]} {f.severity.value}",
+            "Category": _CAT_LABELS.get(f.category, f.category.value),
+            "Finding": f.name,
+            "Detail": f.detail,
+            "Size": _human_size(f.size_bytes) if f.size_bytes else "",
+            "Preview": (f.value_preview[:120] + "…") if len(f.value_preview) > 120 else f.value_preview,
+        })
+    return pd.DataFrame(rows)
 
 
 def render():
-    st.header("🧹 Remove AI Watermarks from Google Doc")
+    st.header("🧹 Remove Image Fingerprints & Watermarks")
     st.caption(
-        "Strips invisible AI/steganographic marks — zero-width spaces & joiners, "
-        "bidirectional controls, the byte-order mark, variation selectors and Unicode "
-        "tag characters — and normalizes look-alike spaces back to a normal space, in "
-        "the tab you point at. This cleans hidden Unicode characters; it cannot detect or verify model-level Claude text watermarks."
+        "Scans uploaded **JPEG / PNG** images for identifying metadata — EXIF (camera "
+        "Make/Model, serial, GPS), C2PA / Content Credentials, AI-generation prompts "
+        "(Stable Diffusion, ComfyUI, Midjourney, DALL·E, Firefly), Photoshop/IPTC blocks, "
+        "ICC profiles, embedded thumbnails and trailing payloads — then strips them. "
+        "Everything runs locally in this app; no image is uploaded anywhere. "
+        "Ported from the open-source [image-fingerprint-remover](https://github.com/lhfer/image-fingerprint-remover)."
+    )
+    st.info(
+        "**Limits:** robust/frequency-domain watermarks (Google SynthID, Digimarc, IMATAG) "
+        "are trained to survive edits — only *nuclear* mode attempts them, and success isn't "
+        "guaranteed. C2PA server-side hashes and PRNU sensor noise can't be removed locally.",
+        icon="⚠️",
     )
 
-    if not require_auth():
-        return
-
-    with st.form("watermark_remover_form"):
-        url = st.text_input(
-            "Google Docs URL",
-            placeholder="https://docs.google.com/document/d/.../edit?tab=t.0",
-            help="Only the tab in the URL is cleaned. If no ?tab= is present, the first tab is used.",
-        )
-        normalize_spaces = st.checkbox(
-            "Normalize look-alike spaces to a normal space",
-            value=True,
-            help="Converts non-breaking / thin / em / narrow spaces (etc.) to a plain space (U+0020). "
-            "Safe — nothing visible changes. Recommended: leave on.",
-        )
-        aggressive = st.checkbox(
-            "Map look-alike letters to ASCII (Cyrillic А→A, fullwidth Ａ→A …)",
-            value=False,
-            help="Fixes disguised letters that look like English but aren't. On by default for "
-            "English-only content. Turn OFF if this doc genuinely contains Russian / Bulgarian / "
-            "CJK / fullwidth text, or it would convert that real text to English letters.",
-        )
-        scan = st.form_submit_button("🔍 Scan document", type="primary")
-
-    if scan:
-        st.session_state.pop("wm_scan", None)
-        if not url.strip():
-            st.error("Please enter a Google Docs URL.")
-            return
-        doc_id = _extract_doc_id(url)
-        if not doc_id:
-            st.error("That doesn't look like a Google Docs URL (no /document/d/… id found).")
-            return
-        try:
-            _, doc = _fetch_doc(get_credentials(), doc_id)
-        except Exception as e:
-            st.error(f"Couldn't open the document: {e}")
-            return
-        body_content, tab_id, tab_name = _resolve_tab(doc, url)
-        edits, stats = _scan(
-            body_content, tab_id, normalize_spaces=normalize_spaces, aggressive=aggressive
-        )
-        st.session_state["wm_scan"] = {
-            "doc_id": doc_id,
-            "url": url,
-            "tab_id": tab_id,
-            "tab_name": tab_name,
-            "title": doc.get("title", "Untitled"),
-            "normalize_spaces": normalize_spaces,
-            "aggressive": aggressive,
-            "stats": stats,
-            "count": stats["total"],
-        }
-
-    scan_state = st.session_state.get("wm_scan")
-    if not scan_state:
-        return
-
-    _render_report(scan_state)
-
-
-def _render_report(s):
-    where = s["title"] + (f" — tab “{s['tab_name']}”" if s.get("tab_name") else "")
-    stats = s["stats"]
-
-    if s["count"] == 0:
-        st.success(f"✅ No watermarks found in {where}. The document is already clean.")
-        return
-
-    st.warning(f"Found **{s['count']}** watermark character(s) in {where}.")
-
-    # Category summary
-    kc = stats["kind_counts"]
-    summary_rows = [
-        {"Category": _KIND_LABELS.get(k, k), "Count": v}
-        for k, v in sorted(kc.items(), key=lambda x: -x[1])
-    ]
-    st.markdown("**By category**")
-    st.dataframe(pd.DataFrame(summary_rows), use_container_width=True, hide_index=True)
-
-    # Per-character detail
-    detail_rows = [
-        {"Character": r["label"], "Category": _KIND_LABELS.get(r["kind"], r["kind"]), "Action": r["action"], "Count": r["count"]}
-        for r in stats["char_rows"]
-    ]
-    st.markdown("**By character**")
-    st.dataframe(pd.DataFrame(detail_rows), use_container_width=True, hide_index=True)
-
-    st.caption(
-        "Scope: body text, tables and table-of-contents of the selected tab. "
-        "Edits are applied via the Google Docs API — you can always undo from the "
-        "document's version history (File ▸ Version history)."
+    files = st.file_uploader(
+        "Upload image(s)",
+        type=["jpg", "jpeg", "png"],
+        accept_multiple_files=True,
+        help="JPEG and PNG only. Multiple files supported.",
     )
 
-    if st.button(f"🧹 Remove {s['count']} watermark(s)", type="primary"):
-        _do_clean(s)
-
-
-def _do_clean(s):
-    from googleapiclient.errors import HttpError
-
-    try:
-        docs_service, doc = _fetch_doc(get_credentials(), s["doc_id"])
-    except Exception as e:
-        st.error(f"Couldn't re-open the document to apply changes: {e}")
-        return
-
-    # Re-scan the freshly fetched doc so indices are guaranteed current.
-    body_content, tab_id, _ = _resolve_tab(doc, s["url"])
-    edits, stats = _scan(
-        body_content,
-        tab_id,
-        normalize_spaces=s["normalize_spaces"],
-        aggressive=s["aggressive"],
+    mode = st.radio(
+        "Cleaning mode",
+        _MODE_KEYS,
+        format_func=lambda k: _MODE_LABELS[k],
+        index=0,
     )
+    if mode in ("paranoid", "nuclear"):
+        st.caption(
+            "⚠️ This mode **re-encodes pixels** — the output is no longer bit-identical to "
+            "the input. Keep your original if you need it."
+        )
 
-    if not edits:
-        st.info("Nothing left to clean — the document is already watermark-free.")
-        st.session_state.pop("wm_scan", None)
+    if not files:
         return
 
-    try:
-        _apply_edits(docs_service, s["doc_id"], tab_id, edits)
-    except HttpError as e:
-        if getattr(e, "resp", None) is not None and e.resp.status == 403:
-            st.error(
-                "Permission denied (403). The signed-in Google account needs **edit** access "
-                "to this document. Open it in Settings, re-authenticate if needed, and make "
-                "sure your token includes Docs write access."
+    for uf in files:
+        data = uf.getvalue()
+        fmt = _detect_format(data)
+        with st.expander(f"📄 {uf.name}  ·  {_human_size(len(data))}", expanded=len(files) == 1):
+            if fmt is None:
+                st.error("Unsupported or corrupt file — only PNG and JPEG are supported.")
+                continue
+
+            report = _inspect(data)
+
+            if report.is_clean and not report.findings:
+                st.success(f"✅ No fingerprints found — **{uf.name}** is already clean.")
+            elif report.is_clean:
+                st.success(
+                    f"✅ No medium/high/critical findings in **{uf.name}**. "
+                    "Only residual low-level fingerprints remain (see table)."
+                )
+            else:
+                crit = sum(1 for f in report.findings if f.severity == Severity.CRITICAL)
+                high = sum(1 for f in report.findings if f.severity == Severity.HIGH)
+                msg = f"Found **{len(report.findings)}** finding(s)"
+                if crit or high:
+                    msg += f" — {crit} critical, {high} high"
+                st.warning(msg + ".")
+
+            if report.findings:
+                st.dataframe(_report_dataframe(report), use_container_width=True, hide_index=True)
+            for note in report.notes:
+                st.caption(note)
+
+            try:
+                cleaned = _clean(data, fmt, mode)
+            except Exception as e:
+                st.error(f"Cleaning failed: {e}")
+                continue
+
+            saved = len(data) - len(cleaned)
+            same_pixels = ""
+            if mode == "safe":
+                same_pixels = " · pixels byte-identical (SHA256-verifiable)"
+            st.markdown(
+                f"**Cleaned:** {_human_size(len(cleaned))} "
+                f"({'−' if saved >= 0 else '+'}{_human_size(abs(saved))}{same_pixels})"
             )
-        else:
-            st.error(f"Google Docs API error: {e}")
-        return
-    except Exception as e:
-        st.error(f"Failed to apply changes: {e}")
-        return
 
-    st.success(f"✅ Removed {len(edits)} watermark character(s) from the document.")
-    st.balloons()
-    st.session_state.pop("wm_scan", None)
+            ext = "png" if fmt == "png" else "jpg"
+            base = uf.name.rsplit(".", 1)[0]
+            st.download_button(
+                f"⬇️ Download cleaned {uf.name}",
+                data=cleaned,
+                file_name=f"{base}_cleaned.{ext}",
+                mime=f"image/{ 'png' if fmt == 'png' else 'jpeg' }",
+                type="primary",
+                key=f"dl_{uf.name}_{mode}",
+            )
